@@ -3,7 +3,7 @@ import torch.nn as nn
 from structure_modules.hyp_layers import HNNLayer,HATLayer,HGCLayer,HSageLayer
 from structure_modules.sphere_layers import SphNNLayer,SphGCLayer,SphATLayer,SphSageLayer
 from structure_modules.eucl_layers import EucATLayer,EucSageLayer,EucGCLayer
-from manifolds.lorentz import Lorentz
+# from manifolds.lorentz import Lorentz
 from geoopt.tensor import ManifoldParameter
 import math
 
