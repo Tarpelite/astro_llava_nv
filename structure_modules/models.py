@@ -18,8 +18,8 @@ class HATencoder(nn.Module):
         self.hat2 = HATLayer(hidden_dim*heads,out_dim, manifold_out,manifold_out, dropout)
 
     def forward(self, x,adj):
-        x = self.hat1(x,adj)
-        x = self.hat2(x,adj)
+        x = self.hat1(x,adj[0])
+        x = self.hat2(x,adj[1])
         return x
 
 class HGCencoder(nn.Module):
@@ -33,8 +33,8 @@ class HGCencoder(nn.Module):
         self.hgc2 = HGCLayer(hidden_dim,out_dim, manifold_out,manifold_out, dropout)
 
     def forward(self, x,adj):
-        x = self.hgc1(x,adj)
-        x = self.hgc2(x,adj)
+        x = self.hgc1(x,adj[0])
+        x = self.hgc2(x,adj[1])
         return x
 
 class HSageencoder(nn.Module):
@@ -48,8 +48,8 @@ class HSageencoder(nn.Module):
         self.hsage2 = HSageLayer(hidden_dim,out_dim, manifold_out,manifold_out, dropout)
 
     def forward(self, x,adj):
-        x = self.hsage1(x,adj)
-        x = self.hsage2(x,adj)
+        x = self.hsage1(x,adj[0])
+        x = self.hsage2(x,adj[1])
         return x
 
 class SphATencoder(nn.Module):
@@ -63,8 +63,8 @@ class SphATencoder(nn.Module):
         self.sphat2 = SphATLayer(hidden_dim,out_dim, manifold_out, manifold_out, dropout)
 
     def forward(self, x,adj):
-        x = self.sphat1(x,adj)
-        x = self.sphat2(x,adj)
+        x = self.sphat1(x,adj[0])
+        x = self.sphat2(x,adj[1])
         return x
 
 class SphGCencoder(nn.Module):
@@ -78,8 +78,8 @@ class SphGCencoder(nn.Module):
         self.sphgc2 = SphGCLayer(hidden_dim,out_dim, manifold_out,manifold_out, dropout)
 
     def forward(self, x,adj):
-        x = self.sphgc1(x,adj)
-        x = self.sphgc2(x,adj)
+        x = self.sphgc1(x,adj[0])
+        x = self.sphgc2(x,adj[1])
         return x
 
 class SphSageencoder(nn.Module):
@@ -93,8 +93,8 @@ class SphSageencoder(nn.Module):
         self.sphsage2 = SphSageLayer(hidden_dim,out_dim, manifold_out,manifold_out, dropout)
 
     def forward(self, x,adj):
-        x = self.sphsage1(x,adj)
-        x = self.sphsage2(x,adj)
+        x = self.sphsage1(x,adj[0])
+        x = self.sphsage2(x,adj[1])
         return x
 
 
@@ -109,8 +109,8 @@ class EucATencoder(nn.Module):
         self.eucphat2 = EucATLayer(hidden_dim,out_dim,  dropout)
 
     def forward(self, x,adj):
-        x = self.eucphat1(x,adj)
-        x = self.eucphat2(x,adj)
+        x = self.eucphat1(x,adj[0])
+        x = self.eucphat2(x,adj[1])
         return x
 
 class EucGCencoder(nn.Module):
@@ -124,8 +124,8 @@ class EucGCencoder(nn.Module):
         self.eucgc2 = EucGCLayer(hidden_dim,out_dim,  dropout)
 
     def forward(self, x,adj):
-        x = self.eucgc1(x,adj)
-        x = self.eucgc2(x,adj)
+        x = self.eucgc1(x,adj[0])
+        x = self.eucgc2(x,adj[1])
         return x
 
 class EucSageencoder(nn.Module):
@@ -139,7 +139,7 @@ class EucSageencoder(nn.Module):
         self.Eucsage2 = EucSageLayer(hidden_dim,out_dim, dropout)
 
     def forward(self, x,adj):
-        x = self.Eucsage1(x,adj)
-        x = self.Eucsage2(x,adj)
+        x = self.Eucsage1(x,adj[0])
+        x = self.Eucsage2(x,adj[1])
         return x
 
