@@ -872,6 +872,8 @@ class AstroMllamaForConditionalGeneration(MllamaPreTrainedModel, GenerationMixin
             )
         return model_kwargs
 
+
+
 if __name__ == "__main__":
     # Test load specformer
     # spec_model_state_dict  = torch.load("/mnt/data/CVPR2025/task1_data/specformer/specformer.ckpt", weights_only=False)
