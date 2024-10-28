@@ -616,22 +616,21 @@ class AstroMllamaForConditionalGeneration(MllamaPreTrainedModel, GenerationMixin
         self.vision_output_dim = config.vision_config.vision_output_dim
         self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
 
-        self.vision_model = MllamaVisionModel._from_config(
-            config.vision_config, attn_implementation=config._attn_implementation
-        )
+        # self.vision_model = MllamaVisionModel._from_config(
+        #     config.vision_config, attn_implementation=config._attn_implementation
+        # )
         self.language_model = AstroMllamaForCausalLM._from_config(
             config.text_config, attn_implementation=config._attn_implementation
         )
 
-        self.spec_model = SpecFormer(
-            embed_dim = 768,
-            input_dim= 22,
-            num_layers= 6,
-            num_heads= 6,
-            max_len= 800,
-            dropout= 0.
-        )
-
+        # self.spec_model = SpecFormer(
+        #     embed_dim = 768,
+        #     input_dim= 22,
+        #     num_layers= 6,
+        #     num_heads= 6,
+        #     max_len= 800,
+        #     dropout= 0.
+        # )
 
         # structure modal projector
         self.structure_modal_projector = nn.Linear(
@@ -687,11 +686,12 @@ class AstroMllamaForConditionalGeneration(MllamaPreTrainedModel, GenerationMixin
         attention_mask: Optional[torch.Tensor] = None,
         # cross_attention_states: Optional[torch.FloatTensor] = None,
         # cross_attention_mask: Optional[torch.Tensor] = None,
+        vision_attention_states: Optional[torch.FloatTensor] = None,
+        vision_attention_mask: Optional[torch.Tensor] = None,
         structure_attention_states: Optional[torch.FloatTensor] = None,
         structure_attention_mask: Optional[torch.Tensor] = None,
         spectrum_attention_states:  Optional[torch.FloatTensor] = None,
-        spectrum_attention_mask: Optional[torch.Tensor] = None,
-       
+        spectrum_attention_mask: Optional[torch.Tensor] = None, 
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
@@ -703,84 +703,43 @@ class AstroMllamaForConditionalGeneration(MllamaPreTrainedModel, GenerationMixin
         cache_position: Optional[torch.LongTensor] = None,
         num_logits_to_keep: int = 0,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        r"""
-        Args:
-            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-                config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-                (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
-
-            num_logits_to_keep (`int`, *optional*):
-                Calculate logits for the last `num_logits_to_keep` tokens. If `0`, calculate logits for all
-                `input_ids` (special case). Only last token logits are needed for generation, and calculating them only for that
-                token can save memory, which becomes pretty significant for long sequences or large vocabulary size.
-
-
-        Returns:
-
-        Example:
-
-        ```python
-        >>> from PIL import Image
-        >>> import requests
-        >>> from transformers import AutoProcessor, MllamaForConditionalGeneration
-
-        >>> checkpoint = "meta-llama/Llama-3.2-11B-Vision"
-        >>> model = MllamaForConditionalGeneration.from_pretrained(checkpoint)
-        >>> processor = AutoProcessor.from_pretrained(checkpoint)
-
-        >>> prompt = "<|image|>If I had to write a haiku for this one"
-        >>> url = "https://www.ilankelman.org/stopsigns/australia.jpg"
-        >>> image = Image.open(requests.get(url, stream=True).raw)
-
-        >>> inputs = processor(text=prompt, images=image, return_tensors="pt")
-
-        >>> # Generate
-        >>> output = model.generate(**inputs, max_new_tokens=15)
-
-        >>> prompt_len = inputs.input_ids.shape[-1]
-        >>> generated_ids = output[:, prompt_len:]
-        >>> generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-        >>> print(generated_text)
-        [', it would be:.\\nA stop sign in Chinatown.\\n']
-        ```
-        """
+  
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError(
-                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
-            )
+        # if (input_ids is None) ^ (inputs_embeds is not None):
+        #     raise ValueError(
+        #         "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+        #     )
 
-        if pixel_values is not None and inputs_embeds is not None:
-            raise ValueError(
-                "You cannot specify both pixel_values and inputs_embeds at the same time, and must specify either one"
-            )
+        # if pixel_values is not None and inputs_embeds is not None:
+        #     raise ValueError(
+        #         "You cannot specify both pixel_values and inputs_embeds at the same time, and must specify either one"
+        #     )
 
-        if pixel_values is not None and vision_attention_states is not None:
-            raise ValueError("`pixel_values` and `cross_attention_states` cannot be provided simultaneously")
+        # if pixel_values is not None and vision_attention_states is not None:
+        #     raise ValueError("`pixel_values` and `cross_attention_states` cannot be provided simultaneously")
 
-        if pixel_values is not None:
-            if aspect_ratio_ids is None:
-                raise ValueError("`aspect_ratio_ids` must be provided if `pixel_values` is provided")
+        # if pixel_values is not None:
+        #     if aspect_ratio_ids is None:
+        #         raise ValueError("`aspect_ratio_ids` must be provided if `pixel_values` is provided")
             
-            # get vision tokens from vision model
-            vision_outputs = self.vision_model(
-                pixel_values=pixel_values,
-                aspect_ratio_ids=aspect_ratio_ids,
-                aspect_ratio_mask=aspect_ratio_mask,
-                output_hidden_states=output_hidden_states,
-                output_attentions=output_attentions,
-                return_dict=return_dict,
-            )
-            vision_attention_states = vision_outputs[0]
-            vision_attention_states = self.multi_modal_projector(vision_attention_states).reshape(
-                -1, vision_attention_states.shape[-2], self.hidden_size
-            )
+        #     # get vision tokens from vision model
+        #     vision_outputs = self.vision_model(
+        #         pixel_values=pixel_values,
+        #         aspect_ratio_ids=aspect_ratio_ids,
+        #         aspect_ratio_mask=aspect_ratio_mask,
+        #         output_hidden_states=output_hidden_states,
+        #         output_attentions=output_attentions,
+        #         return_dict=return_dict,
+        #     )
+        #     vision_attention_states = vision_outputs[0]
+        #     vision_attention_states = self.multi_modal_projector(vision_attention_states).reshape(
+        #         -1, vision_attention_states.shape[-2], self.hidden_size
+        #     )
 
         if vision_attention_mask is not None:
             vision_attention_mask, full_text_row_masked_out_mask = _prepare_cross_attention_mask(
@@ -791,9 +750,9 @@ class AstroMllamaForConditionalGeneration(MllamaPreTrainedModel, GenerationMixin
         else:
             full_text_row_masked_out_mask = None
 
-        if vision_attention_mask is not None and cache_position is not None:
-            vision_attention_mask = vision_attention_mask[:, :, cache_position]
-            full_text_row_masked_out_mask = full_text_row_masked_out_mask[:, :, cache_position]
+        # if vision_attention_mask is not None and cache_position is not None:
+        #     vision_attention_mask = vision_attention_mask[:, :, cache_position]
+        #     full_text_row_masked_out_mask = full_text_row_masked_out_mask[:, :, cache_position]
         
         outputs = self.language_model(
             input_ids=input_ids,
@@ -905,21 +864,23 @@ class AstroMllamaForConditionalGeneration(MllamaPreTrainedModel, GenerationMixin
 
 if __name__ == "__main__":
     # Test load specformer
-    spec_model_state_dict  = torch.load("/mnt/data/CVPR2025/task1_data/specformer/specformer.ckpt", weights_only=False)
-    spec_model = SpecFormer(
-            embed_dim = 768,
-            input_dim= 22,
-            num_layers= 6,
-            num_heads= 6,
-            max_len= 800,
-            dropout= 0.
-        )
-    print(spec_model.load_state_dict(spec_model_state_dict['state_dict'])) # <All keys matched successfully>
+    # spec_model_state_dict  = torch.load("/mnt/data/CVPR2025/task1_data/specformer/specformer.ckpt", weights_only=False)
+    # spec_model = SpecFormer(
+    #         embed_dim = 768,
+    #         input_dim= 22,
+    #         num_layers= 6,
+    #         num_heads= 6,
+    #         max_len= 800,
+    #         dropout= 0.
+    #     )
+    # print(spec_model.load_state_dict(spec_model_state_dict['state_dict'])) # <All keys matched successfully>
 
     # Test load llama-3.1-v-11B
-    checkpoint="/mnt/data/CVPR2025/task1_data/Llama-3.2-11B-Vision-Instruct"
+    checkpoint="/mnt/data/CVPR2025/task1_data/Llama-3.2-11B-Vision-Instruct/original/consolidated.pth"
     mllama_state_dict = torch.load(checkpoint, weights_only=False)
-    import pudb; pu.db;
+ 
+    # Make new model
+    
     
 
 

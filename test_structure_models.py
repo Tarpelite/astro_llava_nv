@@ -1,5 +1,5 @@
 import torch
-from modules.models import HSageencoder,SphSageencoder,EucGCencoder,HGCencoder,SphGCencoder,EucSageencoder
+from structure_modules.models import HSageencoder,SphSageencoder,EucGCencoder,HGCencoder,SphGCencoder,EucSageencoder
 from torch_geometric.datasets import Planetoid
 import torch_geometric.transforms as T
 import geoopt
