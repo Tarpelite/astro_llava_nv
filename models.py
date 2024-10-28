@@ -17,9 +17,10 @@ from transformers.generation import GenerationMixin
 
 from spec_models import SpecFormer
 from structure_models import StructureEncoder
+from transformers.configuration_utils import PretrainedConfig
 
 
-class AstrollavaTextConfig(MllamaTextConfig):
+class AstrollavaTextConfig(PretrainedConfig):
     model_type = "mllama_text_model"
 
     def __init__(
@@ -644,11 +645,11 @@ class AstroMllamaForConditionalGeneration(MllamaPreTrainedModel, GenerationMixin
         )
 
         # vision modal projector
-        self.multi_modal_projector = nn.Linear(
-            config.vision_config.vision_output_dim,
-            config.text_config.hidden_size,
-            bias=True,
-        )
+        # self.multi_modal_projector = nn.Linear(
+        #     config.vision_config.vision_output_dim,
+        #     config.text_config.hidden_size,
+        #     bias=True,
+        # )
        
         self.post_init()
 
@@ -744,9 +745,10 @@ class AstroMllamaForConditionalGeneration(MllamaPreTrainedModel, GenerationMixin
         spectrum_attention_states = self.spectrum_modal_projector
         (spectrum_attention_states).reshape(-1, spectrum_attention_states.shape[-2], self.hidden_size)
         
-        vision_attention_states = self.multi_modal_projector(vision_attention_states).reshape(
-            -1, vision_attention_states.shape[-2], self.hidden_size
-        )
+        # vision_attention_states = self.multi_modal_projector(vision_attention_states).reshape(
+        #     -1, vision_attention_states.shape[-2], self.hidden_size
+        # )
+        # vision states has been processed
 
         if vision_attention_mask is not None:
             vision_attention_mask, full_text_row_masked_out_mask = _prepare_cross_attention_mask(

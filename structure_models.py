@@ -26,7 +26,7 @@ class StructureEncoder(nn.Module):
     
     def forward(self,
             node_features=None, #[n_node, in_dim]
-            edge_index_list = None # here is a list containing [spectrum edge, ra/dec edge]
+            edge_index_list = None, # here is a list containing [spectrum edge, ra/dec edge]
             target_node_idx=None #[2, num_edges]
             ):
         """Note: No support for batchify, one graph each time"""
