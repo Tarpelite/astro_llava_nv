@@ -19,7 +19,7 @@ class StructureEncoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.out_dim = out_dim
 
-        self.euc_encoder = EucSageencoder(in_dim=, hidden_dim=hidden_dim, out_dim=out_dim, manifold_in=Euclidean(),manifold_out=Euclidean())
+        self.euc_encoder = EucSageencoder(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim, manifold_in=Euclidean(),manifold_out=Euclidean())
         self.sph_encoder = SphGCencoder(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim, manifold_in=Euclidean(),manifold_out=Sphere())
         self.hgc_encoder = HGCencoder(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim, manifold_in=Euclidean(),manifold_out= geoopt.PoincareBall())
 

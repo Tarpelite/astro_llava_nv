@@ -16,7 +16,7 @@ from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 from transformers.generation import GenerationMixin
 
 from spec_models import SpecFormer
-
+from structure_models import StructureEncoder
 
 
 class AstrollavaTextConfig(MllamaTextConfig):
@@ -623,25 +623,22 @@ class AstroMllamaForConditionalGeneration(MllamaPreTrainedModel, GenerationMixin
             config.text_config, attn_implementation=config._attn_implementation
         )
 
-        # self.spec_model = SpecFormer(
-        #     embed_dim = 768,
-        #     input_dim= 22,
-        #     num_layers= 6,
-        #     num_heads= 6,
-        #     max_len= 800,
-        #     dropout= 0.
+        # self.structure_model = StructureEncoder(
+        #     in_dim = 1024,
+        #     hidden_dim= 512,
+        #     out_dim = 256
         # )
 
         # structure modal projector
         self.structure_modal_projector = nn.Linear(
-            config.text_config.structure_output_dim,
+            256,
             config.text_config.hidden_size,
             bias = True,
         )
 
         # spectrum modal projector
         self.spectrum_modal_projector =  nn.Linear(
-            768, # hard coded
+            1024, # hard coded
             config.text_config.hidden_size,
             bias = True,
         )
@@ -741,6 +738,16 @@ class AstroMllamaForConditionalGeneration(MllamaPreTrainedModel, GenerationMixin
         #         -1, vision_attention_states.shape[-2], self.hidden_size
         #     )
 
+        structure_attention_states = self.structure_modal_projector
+        (structure_attention_states).reshape(-1, structure_attention_states.shape[-2], self.hidden_size)
+
+        spectrum_attention_states = self.spectrum_modal_projector
+        (spectrum_attention_states).reshape(-1, spectrum_attention_states.shape[-2], self.hidden_size)
+        
+        vision_attention_states = self.multi_modal_projector(vision_attention_states).reshape(
+            -1, vision_attention_states.shape[-2], self.hidden_size
+        )
+
         if vision_attention_mask is not None:
             vision_attention_mask, full_text_row_masked_out_mask = _prepare_cross_attention_mask(
                 vision_attention_mask,
@@ -790,6 +797,7 @@ class AstroMllamaForConditionalGeneration(MllamaPreTrainedModel, GenerationMixin
         aspect_ratio_ids=None,
         aspect_ratio_mask=None,
         cross_attention_mask=None,
+
         past_key_values=None,
         use_cache=False,
         cache_position=None,
@@ -880,6 +888,7 @@ if __name__ == "__main__":
     mllama_state_dict = torch.load(checkpoint, weights_only=False)
  
     # Make new model
+    config = AstrollavaConfig.from_pretrained("/mnt/data/CVPR2025/task1_data/Llama-3.2-11B-Vision-Instruct/")
     
     
 
