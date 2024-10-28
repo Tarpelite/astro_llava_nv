@@ -9,16 +9,23 @@ from manifolds.sphere import Sphere
 
 
 class StructureEncoder(nn.Module):
-    def __init__(self):
+    def __init__(self,
+                in_dim=1433,
+                hidden_dim=512,
+                out_dim=256):
         super().__init__()
 
-        self.euc_encoder = EucSageencoder(in_dim=1433, hidden_dim=512, out_dim=256, manifold_in=Euclidean(),manifold_out=Euclidean())
-        self.sph_encoder = SphGCencoder(in_dim=1433, hidden_dim=512, out_dim=256, manifold_in=Euclidean(),manifold_out=Sphere())
-        self.hgc_encoder = HGCencoder(in_dim=1433, hidden_dim=512, out_dim=256, manifold_in=Euclidean(),manifold_out= geoopt.PoincareBall())
+        self.in_dim = in_dim
+        self.hidden_dim = hidden_dim
+        self.out_dim = out_dim
+
+        self.euc_encoder = EucSageencoder(in_dim=, hidden_dim=hidden_dim, out_dim=out_dim, manifold_in=Euclidean(),manifold_out=Euclidean())
+        self.sph_encoder = SphGCencoder(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim, manifold_in=Euclidean(),manifold_out=Sphere())
+        self.hgc_encoder = HGCencoder(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim, manifold_in=Euclidean(),manifold_out= geoopt.PoincareBall())
 
     
     def forward(self,
-            node_features=None, #[n_node, 1433]
+            node_features=None, #[n_node, in_dim]
             euc_edge_index=None, #[2, num_edges]
             sph_edge_index=None, #[2, num_edges]
             hgc_edge_index=None, #[2, num_edges]
