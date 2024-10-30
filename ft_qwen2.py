@@ -88,7 +88,7 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=2e-5)
     parser.add_argument("--warmup_steps", type=int, default=500)
     parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--logging_steps", type=int, default=1)
+    parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--save_steps", type=int, default=500)
     return parser.parse_args()
 
@@ -109,8 +109,11 @@ def evaluate_model(
     task_type: str,
     batch_size: int,
     accelerator: Accelerator
-) -> float:
-    """Evaluate the model on a specific task."""
+) -> Tuple[float, float]:
+    """
+    Evaluate the model on a specific task.
+    Returns both MSE and R2 score.
+    """
     model.eval()
     predictions = []
     ground_truths = []
@@ -129,6 +132,7 @@ def evaluate_model(
     
     eval_dataloader = accelerator.prepare(eval_dataloader)
     
+    print("evaluate on task {}".format(task_type))
     with torch.no_grad():
         for batch in eval_dataloader:
             inputs = batch['processed_inputs']
@@ -136,9 +140,12 @@ def evaluate_model(
             # Generate outputs
             generated_ids = accelerator.unwrap_model(model).generate(
                 **inputs,
-                max_new_tokens=5,
+                max_new_tokens=10,
                 num_beams=1,
                 do_sample=False,
+                top_p = None,
+                top_k = None,
+                temperature = None
             )
             
             # Trim generated ids
@@ -159,6 +166,7 @@ def evaluate_model(
             
             # Extract predicted values
             for output in decoded_outputs:
+                print(output)
                 pred_value = extract_number_from_text(output)
                 predictions.append(pred_value)
     
@@ -167,7 +175,7 @@ def evaluate_model(
                    if not (np.isnan(p) or np.isnan(g))]
     
     if not valid_pairs:
-        return float('inf')
+        return float('inf'), float('nan')
     
     pred_array = np.array([p for p, _ in valid_pairs])
     gt_array = np.array([g for _, g in valid_pairs])
@@ -175,7 +183,12 @@ def evaluate_model(
     # Calculate MSE
     mse = np.mean((pred_array - gt_array) ** 2)
     
-    return mse
+    # Calculate R² score
+    ss_res = np.sum((gt_array - pred_array) ** 2)
+    ss_tot = np.sum((gt_array - np.mean(gt_array)) ** 2)
+    r2 = 1 - (ss_res / ss_tot) if ss_tot != 0 else float('nan')
+    
+    return mse, r2
 
 def train():
     args = parse_args()
@@ -283,6 +296,7 @@ def train():
     # Training loop
     global_step = 0
     best_avg_mse = float('inf')
+    best_avg_r2 = float('-inf')
     
     for epoch in range(args.num_train_epochs):
         model.train()
@@ -327,10 +341,10 @@ def train():
                 if global_step % args.eval_steps == 0:
                     logger.info(f"Evaluating at step {global_step}...")
                     model.eval()
-                    task_mses = {}
+                    task_metrics = {}
                     
                     for task in eval_tasks:
-                        mse = evaluate_model(
+                        mse, r2 = evaluate_model(
                             model=model,
                             eval_dataset=eval_dataset,
                             processor=processor,
@@ -338,16 +352,28 @@ def train():
                             batch_size=args.eval_batch_size,
                             accelerator=accelerator
                         )
-                        task_mses[task] = mse
-                        accelerator.log({f"eval_{task}_mse": mse}, step=global_step)
+                        task_metrics[task] = {'mse': mse, 'r2': r2}
+                        
+                        # Log metrics under 'eval' category
+                        accelerator.log({
+                            f"eval/metrics/{task}/mse": mse,
+                            f"eval/metrics/{task}/r2": r2
+                        }, step=global_step)
                     
-                    # Calculate and log average MSE
-                    avg_mse = np.mean(list(task_mses.values()))
-                    accelerator.log({"eval_avg_mse": avg_mse}, step=global_step)
+                    # Calculate and log average metrics
+                    avg_mse = np.mean([metrics['mse'] for metrics in task_metrics.values()])
+                    avg_r2 = np.mean([metrics['r2'] for metrics in task_metrics.values() 
+                                    if not np.isnan(metrics['r2'])])
                     
-                    # Save best model
-                    if avg_mse < best_avg_mse and accelerator.is_main_process:
-                        best_avg_mse = avg_mse
+                    accelerator.log({
+                        "eval/average/mse": avg_mse,
+                        "eval/average/r2": avg_r2
+                    }, step=global_step)
+                    
+                    # Save best model based on both metrics
+                    if (avg_mse < best_avg_mse or avg_r2 > best_avg_r2) and accelerator.is_main_process:
+                        best_avg_mse = min(best_avg_mse, avg_mse)
+                        best_avg_r2 = max(best_avg_r2, avg_r2)
                         unwrapped_model = accelerator.unwrap_model(model)
                         unwrapped_model.save_pretrained(
                             os.path.join(args.output_dir, "best_model"),
@@ -355,7 +381,7 @@ def train():
                         )
                     
                     model.train()
-                
+                        
                 # Save regular checkpoint
                 if global_step % args.save_steps == 0 and accelerator.is_main_process:
                     unwrapped_model = accelerator.unwrap_model(model)

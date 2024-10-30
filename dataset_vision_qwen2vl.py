@@ -171,12 +171,12 @@ class Qwen2VLDataset(Dataset):
                     videos=video_inputs,
                     # padding=True,
                     return_tensors="pt",
-                    text_kwargs={
-                        "max_length" : self.max_length,
-                        "padding": "max_length",
-                        "padding_side":"left",
-                        "truncation": True
-                    }
+                    # text_kwargs={
+                    #     "max_length" : self.max_length,
+                    #     "padding": "max_length",
+                    #     "padding_side":"right",
+                    #     "truncation": True
+                    # }
                     
                 )
             
