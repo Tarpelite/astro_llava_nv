@@ -13,7 +13,8 @@ from tqdm.auto import tqdm
 import numpy as np
 import re
 
-from dataset_vision_qwen2vl import Qwen2VLDataset
+from models_astro_qwen2 import AstroQwen2VL
+from dataset_vision_qwen2vl_xval import Qwen2VLDataset
 
 torch.set_float32_matmul_precision('high')
 
@@ -133,48 +134,33 @@ def evaluate_model(
     eval_dataloader = accelerator.prepare(eval_dataloader)
     
     print("evaluate on task {}".format(task_type))
+    # import pudb;pu.db;
     with torch.no_grad():
         for batch in eval_dataloader:
             inputs = batch['processed_inputs']
             
             # Generate outputs
-            generated_ids = accelerator.unwrap_model(model).generate(
-                **inputs,
-                max_new_tokens=10,
-                num_beams=1,
-                do_sample=False,
-                top_p = None,
-                top_k = None,
-                temperature = None
-            )
+            output = accelerator.unwrap_model(model)(
+                **inputs)
             
-            # Trim generated ids
-            generated_ids_trimmed = [
-                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs['input_ids'], generated_ids)
-            ]
-            
-            # Decode outputs
-            decoded_outputs = processor.batch_decode(
-                generated_ids_trimmed,
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=False
-            )
+            decoded_outputs = output.num.detach().cpu().tolist()
             
             # Extract ground truth values
-            for ans in batch['answers']:
+            for ans in batch['answers'].detach().cpu().tolist():
                 ground_truths.extend(ans)
+                # print(ans)
             
             # Extract predicted values
             for output in decoded_outputs:
-                print(output)
-                pred_value = extract_number_from_text(output)
+                # print(output)
+                pred_value = output
                 predictions.append(pred_value)
     
     # Filter out NaN values
     valid_pairs = [(p, g) for p, g in zip(predictions, ground_truths) 
                    if not (np.isnan(p) or np.isnan(g))]
-    
     print(valid_pairs)
+    
     if not valid_pairs:
         return float('inf'), float('nan')
     
@@ -190,6 +176,37 @@ def evaluate_model(
     r2 = 1 - (ss_res / ss_tot) if ss_tot != 0 else float('nan')
     
     return mse, r2
+
+def get_optimizer(model, args):
+    # 将参数分成两组
+    num_head_params = []
+    other_params = []
+    
+    # 遍历模型参数
+    for name, param in model.named_parameters():
+        if 'num_head.weight' in name:
+            num_head_params.append(param)
+        else:
+            other_params.append(param)
+    
+    # 创建参数组，为num_head.weight使用更大的学习率
+    param_groups = [
+        {
+            'params': other_params,
+            'lr': args.learning_rate,
+            'weight_decay': args.weight_decay
+        },
+        {
+            'params': num_head_params,
+            'lr': args.learning_rate * 2,  # 10倍于基础学习率
+            'weight_decay': args.weight_decay
+        }
+    ]
+    
+    # 初始化optimizer
+    optimizer = torch.optim.AdamW(param_groups)
+    
+    return optimizer
 
 def train():
     args = parse_args()
@@ -226,7 +243,7 @@ def train():
     min_pixels = 110*110*3
     max_pixels = 110*110*3
     processor = AutoProcessor.from_pretrained(args.model_path, min_pixels=min_pixels, max_pixels=max_pixels)
-    model = Qwen2VLForConditionalGeneration.from_pretrained(
+    model = AstroQwen2VL.from_pretrained(
         args.model_path,
         torch_dtype=torch.bfloat16
     )
@@ -263,11 +280,13 @@ def train():
     )
     
     # Initialize optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay
-    )
+    # optimizer = torch.optim.AdamW(
+    #     model.parameters(),
+    #     lr=args.learning_rate,
+    #     weight_decay=args.weight_decay
+    # )
+
+    optimizer = get_optimizer(model, args)
     
     # Calculate training steps
     num_update_steps_per_epoch = len(train_dataloader) // args.gradient_accumulation_steps

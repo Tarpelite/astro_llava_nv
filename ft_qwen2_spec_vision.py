@@ -13,7 +13,8 @@ from tqdm.auto import tqdm
 import numpy as np
 import re
 
-from dataset_vision_qwen2vl import Qwen2VLDataset
+from models_astro_qwen2 import AstroQwen2VLSpec
+from dataset_vision_spec_qwen2vl import Qwen2VLDataset
 
 torch.set_float32_matmul_precision('high')
 
@@ -226,7 +227,7 @@ def train():
     min_pixels = 110*110*3
     max_pixels = 110*110*3
     processor = AutoProcessor.from_pretrained(args.model_path, min_pixels=min_pixels, max_pixels=max_pixels)
-    model = Qwen2VLForConditionalGeneration.from_pretrained(
+    model = AstroQwen2VLSpec.from_pretrained(
         args.model_path,
         torch_dtype=torch.bfloat16
     )
