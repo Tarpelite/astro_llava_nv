@@ -914,6 +914,9 @@ class AstroQwen2VLFull(Qwen2VLPreTrainedModel, GenerationMixin):
         self.padding_side = "left"  # set it to left by default, user can use setter to change padding_sides
 
         self.spec_token_id = 73780 # spectrum token is Ã
+        self.euc_token_id = 79607 # euc token is þ
+        self.hyp_token_id = 65013 # hyp token is æ
+        self.sph_token_id = 38118 # sph token is ø
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -1118,6 +1121,9 @@ class AstroQwen2VLFull(Qwen2VLPreTrainedModel, GenerationMixin):
         pixel_values: Optional[torch.Tensor] = None,
         pixel_values_videos: Optional[torch.FloatTensor] = None,
         spec_features: Optional[torch.FloatTensor] = None,
+        euc_features: Optional[torch.FloatTensor] = None,
+        hyp_features: Optional[torch.FloatTensor] = None,
+        sph_features: Optional[torch.FloatTensor] = None,
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
         rope_deltas: Optional[torch.LongTensor] = None,
@@ -1184,6 +1190,23 @@ class AstroQwen2VLFull(Qwen2VLPreTrainedModel, GenerationMixin):
                 spec_embeds = spec_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(spec_mask, spec_embeds)
 
+            if euc_features is not None:
+                euc_embeds = self.struc_projector(euc_features)
+                euc_mask = (input_ids == self.euc_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+                euc_embeds = euc_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                inputs_embeds = inputs_embeds.masked_scatter(euc_mask, euc_embeds)
+
+            if hyp_features is not None:
+                hyp_embeds = self.struc_projector(hyp_features)
+                hyp_mask = (input_ids == self.hyp_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+                hyp_embeds = hyp_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                inputs_embeds = inputs_embeds.masked_scatter(hyp_mask, hyp_embeds)
+
+            if sph_features is not None:
+                sph_embeds = self.struc_projector(sph_features)
+                sph_mask = (input_ids == self.sph_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+                sph_embeds = sph_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                inputs_embeds = inputs_embeds.masked_scatter(sph_mask, sph_embeds)
 
             if pixel_values_videos is not None:
                 pixel_values_videos = pixel_values_videos.type(self.visual.get_dtype())
@@ -1249,6 +1272,9 @@ class AstroQwen2VLFull(Qwen2VLPreTrainedModel, GenerationMixin):
         pixel_values=None,
         pixel_values_videos=None,
         spec_features=None,
+        euc_features = None,
+        hyp_features = None,
+        sph_features = None,
         image_grid_thw=None,
         video_grid_thw=None,
         **kwargs,
@@ -1319,6 +1345,9 @@ class AstroQwen2VLFull(Qwen2VLPreTrainedModel, GenerationMixin):
                 "pixel_values": pixel_values,
                 "pixel_values_videos": pixel_values_videos,
                 "spec_features": spec_features,
+                "euc_features": euc_features,
+                "hyp_features": hyp_features,
+                "sph_features": sph_features,
                 "image_grid_thw": image_grid_thw,
                 "video_grid_thw": video_grid_thw,
                 "rope_deltas": rope_deltas,
