@@ -1,0 +1,6 @@
+Task	MSE
+task1_redshift	0.624019
+task2_log_mstar	59.837123
+task2_z_mw	36.340063
+task2_sSFR	30.905558
+task2_tage_mw	32.385802

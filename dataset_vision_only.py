@@ -19,12 +19,14 @@ class MLLamaDataset(Dataset):
         split: str = "train",
         num_questions: int = 5,
         max_length: int = 512,
+        max_samples=None
     ):
         self.split = split
         self.image_dir = image_dir
         self.processor = processor
         self.num_questions = num_questions
         self.max_length = max_length
+        self.max_samples = max_samples
         
         # 加载元数据
         self.data = Table.read(hdf5_path)
@@ -44,7 +46,10 @@ class MLLamaDataset(Dataset):
         }
         
     def __len__(self) -> int:
-        return len(self.data)
+        if self.max_samples is not None:
+            return self.max_samples
+        else:
+            return len(self.data)
     
     def _load_image(self, target_id: str) -> Image.Image:
         image_path = os.path.join(self.image_dir, f"{target_id}.png")
@@ -60,9 +65,11 @@ class MLLamaDataset(Dataset):
         template = self.templates[task_type]  
         answer_key = self.answer_mapping[task_type]
         answer = self._get_value(row_data, answer_key)
-        
-        text = template.replace("[ANS]", f"{answer:.6f}")
-        return text
+        if self.split == "train":
+            text = template.replace("[ANS]", f"{answer:.6f}")
+        else:
+            text = template.replace("[ANS]", "")
+        return text, answer
     
     def __getitem__(self, idx: int) -> Dict:
         row = self.data[idx]
@@ -77,13 +84,16 @@ class MLLamaDataset(Dataset):
         
         # 构造文本序列
         text_sequences = []
+        answers = []
         for task in selected_tasks:
-            text = self._construct_text_sequence(row, task)
+            text, ans = self._construct_text_sequence(row, task)
             text_sequences.append(text)
+            answers.append(ans)
         
         # 使用processor处理输入
         processed_samples = []
-        for text in text_sequences:
+        padding_side = "left" if self.split == "eval" else "right"
+        for text, ans in zip(text_sequences, answers):
             inputs = self.processor(
                 images=image,
                 text=text,
@@ -91,7 +101,8 @@ class MLLamaDataset(Dataset):
                     "padding": "max_length",
                     "truncation": True,
                     "max_length": self.max_length,
-                    "return_tensors": "pt"
+                    "return_tensors": "pt",
+                    "padding_side": padding_side
                 },
                 # images_kwargs={
                 #     "size": {"height": 110, "width": 110}  # 设置图片尺寸
@@ -112,6 +123,7 @@ class MLLamaDataset(Dataset):
             'target_id': target_id,
             'processed_inputs': processed_samples,
             'text_sequences': text_sequences,
+            "answers": answers,
             'raw_image': image
         }
 
@@ -119,6 +131,7 @@ class MLLamaDataset(Dataset):
     def collate_fn(batch: List[Dict]) -> Dict:
         target_ids = [item['target_id'] for item in batch]
         all_text_sequences = [item['text_sequences'] for item in batch]
+        all_answers = [item["answers"] for item in batch]
         
         all_processed_inputs = []
         for item in batch:
@@ -179,6 +192,7 @@ class MLLamaDataset(Dataset):
         return {
             'target_ids': target_ids,
             'text_sequences': all_text_sequences,
+            'answers':all_answers,
             'processed_inputs': batch_inputs
         }
 
