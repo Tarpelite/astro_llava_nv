@@ -8,6 +8,10 @@ from typing import List, Optional, Tuple, Union, Dict
 from transformers.models.mllama.configuration_mllama import MllamaTextConfig,MllamaVisionConfig
 from transformers.models.mllama.modeling_mllama import MllamaCrossAttentionDecoderLayer, MllamaPreTrainedModel, MllamaSelfAttentionDecoderLayer, MllamaTextRMSNorm, MllamaRotaryEmbedding, _prepare_4d_causal_attention_mask_with_cache_position,MllamaVisionModel,_prepare_cross_attention_mask
 
+
+#Qwen2-VL
+from transformers.models.qwen2_vl.modeling_qwen2_vl import 
+
 from transformers.utils import logging
 from transformers.modeling_rope_utils import rope_config_validation
 from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPast, CausalLMOutputWithPast

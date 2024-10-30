@@ -2,13 +2,14 @@ import os
 import argparse
 import torch
 import numpy as np
-from torch.utils.data import DataLoader
-from transformers import AutoProcessor, MllamaForConditionalGeneration
+from torch.utils.data import DataLoader, Dataset
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 from tqdm import tqdm
-from dataset_vision_only import MLLamaDataset
+from qwen_vl_utils import process_vision_info
+from typing import Dict, List, Tuple
 import logging
 import re
-from typing import Dict, List, Tuple
+from dataset_vision_qwen2vl import Qwen2VLDataset
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -19,12 +20,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate MLLama model on different tasks")
+    parser = argparse.ArgumentParser(description="Evaluate Qwen2VL model on different tasks")
     parser.add_argument(
         "--model_path",
         type=str,
         required=True,
-        help="Path to the trained model",
+        help="Path to the Qwen2VL model",
     )
     parser.add_argument(
         "--hdf5_path",
@@ -51,6 +52,12 @@ def parse_args():
         help="Batch size for evaluation",
     )
     parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=8,
+        help="number of workers",
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         default="./evaluation_results",
@@ -60,9 +67,7 @@ def parse_args():
 
 def extract_number_from_text(text: str) -> float:
     """Extract the numerical value from the model's output text."""
-    # Assuming the format is something like "The value is [NUMBER]"
     try:
-        # Look for a decimal number in the text
         match = re.search(r'-?\d*\.?\d+', text)
         if match:
             return float(match.group())
@@ -70,20 +75,11 @@ def extract_number_from_text(text: str) -> float:
     except:
         return float('nan')
 
-def decode_outputs(processor, output_ids: torch.Tensor) -> List[str]:
-    """Decode the model output ids to text."""
-    decoded_outputs = []
-    for output_id in output_ids:
-        # Remove padding tokens
-        output_id = output_id[output_id != processor.tokenizer.pad_token_id]
-        decoded_text = processor.decode(output_id, skip_special_tokens=True)
-        decoded_outputs.append(decoded_text)
-    return decoded_outputs
-
 def evaluate_by_task(
-    model: MllamaForConditionalGeneration,
+    args,
+    model: Qwen2VLForConditionalGeneration,
     processor,
-    eval_dataset: MLLamaDataset,
+    eval_dataset: Dataset,
     task_type: str,
     batch_size: int,
     device: torch.device
@@ -102,8 +98,8 @@ def evaluate_by_task(
         eval_dataset,
         batch_size=batch_size,
         shuffle=False,
-        collate_fn=MLLamaDataset.collate_fn,
-        num_workers=4
+        collate_fn=eval_dataset.collate_fn,
+        num_workers=args.num_workers
     )
     
     with torch.no_grad():
@@ -112,38 +108,37 @@ def evaluate_by_task(
             inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
                      for k, v in batch['processed_inputs'].items()}
             
-            # Generate outputs using greedy decoding
+            import pudb;pu.db;
+            # Generate outputs
             generated_ids = model.generate(
-                input_ids=inputs['input_ids'],
-                attention_mask=inputs['attention_mask'],
-                pixel_values=inputs['pixel_values'],
-                aspect_ratio_ids=inputs['aspect_ratio_ids'],  # Added this
-                aspect_ratio_mask=inputs['aspect_ratio_mask'],  # Added this
-                max_new_tokens=10,
-                num_beams=1,  # greedy decoding
+                **inputs,
+                max_new_tokens=5,
+                num_beams=1,
                 do_sample=False,
-                output_scores=False,
-                return_dict_in_generate=True,
-            ).sequences
+            )
+            
+            # Trim generated ids to only include new tokens
+            generated_ids_trimmed = [
+                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs['input_ids'], generated_ids)
+            ]
             
             # Decode outputs
-            decoded_outputs = decode_outputs(processor, generated_ids)
-
-            # import pudb;pu.db
+            decoded_outputs = processor.batch_decode(
+                generated_ids_trimmed,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False
+            )
             
-            # Extract ground truth values from the original text sequences
+            # Extract ground truth values
             for ans in batch['answers']:
-                # ground_truth = extract_number_from_text(ans)  # [0] because num_questions=1
                 ground_truths.append(ans[0])
-                print("ground_truths", ans[0])
             
             # Extract predicted values
             for output in decoded_outputs:
-                # import pudb;pu.db;
-                print(output)
                 pred_value = extract_number_from_text(output)
+                print(output)
                 predictions.append(pred_value)
-                print("pred_values", pred_value)
+                print(f"Prediction: {pred_value}")
                 
     # Filter out any NaN values
     valid_pairs = [(p, g) for p, g in zip(predictions, ground_truths) 
@@ -172,19 +167,30 @@ def main():
     
     # Load model and processor
     processor = AutoProcessor.from_pretrained(args.model_path)
-    model = MllamaForConditionalGeneration.from_pretrained(args.model_path).bfloat16()
+    model = Qwen2VLForConditionalGeneration.from_pretrained(
+        args.model_path,
+        torch_dtype=torch.bfloat16
+    )
     model.to(device)
     
     # Initialize dataset
-    eval_dataset = MLLamaDataset(
+    min_pixels = 110*110*3
+    max_pixels = 110*110*3
+    processor = AutoProcessor.from_pretrained(
+        args.model_path,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels
+    )
+    
+    eval_dataset = Qwen2VLDataset(
         hdf5_path=args.hdf5_path,
         image_dir=args.image_dir,
         template_path=args.template_path,
         processor=processor,
         split="eval",
-        num_questions=1,  # Will be set per task
-        max_length=256,
-        max_samples=100
+        num_questions=1,
+        max_length=512,
+        max_samples=None
     )
     
     # Tasks to evaluate
@@ -203,6 +209,7 @@ def main():
     for task in tasks:
         logger.info(f"\nEvaluating task: {task}")
         mse, pred_gt_pairs = evaluate_by_task(
+            args,
             model=model,
             processor=processor,
             eval_dataset=eval_dataset,
