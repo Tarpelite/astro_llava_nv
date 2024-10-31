@@ -115,6 +115,11 @@ class Qwen2VLDataset(Dataset):
         row = self.data[idx]
         target_id = str(row['TARGETID'])
         spectrum_feature = row["spectrum_feature"]
+        euc_feature = row["eucembeddings"]
+        hyp_feature = row["hypembeddings"]
+        sph_feature = row["sphembeddings"]
+
+
         # Load image
         image = self._load_image(target_id)
         
@@ -136,14 +141,23 @@ class Qwen2VLDataset(Dataset):
         processed_samples = []
         for messages in all_messages:
             # Prepare text using chat template
+            add_generation_prompt = False if self.split == "train" else True
+
             text = self.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+                messages, tokenize=False, add_generation_prompt=add_generation_prompt
             )
             
             # Move image_pad to correct position
             text = text.replace("<|vision_start|><|image_pad|><|vision_end|>", "").replace(
                 " <|image_pad|> ", "<|vision_start|><|image_pad|><|vision_end|>"
             )
+
+            # with open("tmp.txt", "w+", encoding="utf-8") as f:
+            #     f.write(text)
+            # print(text)
+            # text = text.replace("<|im_end|><|im_start|>\nassistant", "<|im_end|>")
+
+            
             
             # Process vision info
             image_inputs, video_inputs = process_vision_info(messages)
@@ -183,8 +197,12 @@ class Qwen2VLDataset(Dataset):
             inputs = {k: v.squeeze(0) for k, v in inputs.items()}
             # print(inputs.keys())
             inputs["spec_features"] = torch.tensor(spectrum_feature)
+            inputs["euc_features"] = torch.tensor(euc_feature)
+            inputs["hyp_features"] = torch.tensor(hyp_feature)
+            inputs["sph_features"] = torch.tensor(sph_feature)
+
             processed_samples.append(inputs)
-            
+        # print(text_sequences)
         return {
             'target_id': target_id,
             'processed_inputs': processed_samples,
@@ -208,8 +226,10 @@ class Qwen2VLDataset(Dataset):
             'attention_mask': torch.stack([inputs['attention_mask'] for inputs in all_processed_inputs]),
             'pixel_values': torch.stack([inputs['pixel_values'] for inputs in all_processed_inputs]),
             'spec_features': torch.stack([inputs['spec_features'] for inputs in all_processed_inputs]),
+            'euc_features': torch.stack([inputs['euc_features'] for inputs in all_processed_inputs]),
+            'hyp_features': torch.stack([inputs['hyp_features'] for inputs in all_processed_inputs]),
+            'sph_features': torch.stack([inputs['sph_features'] for inputs in all_processed_inputs]),
             'image_grid_thw': torch.stack([inputs['image_grid_thw'] for inputs in all_processed_inputs]),
-           
         }
 
         labels = batch_inputs["input_ids"].clone()

@@ -13,6 +13,7 @@ from transformers.modeling_outputs import (
 
 import torch.nn as nn
 import torch
+import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss, LayerNorm
 from dataclasses import dataclass
 
@@ -28,6 +29,25 @@ class AstroQwen2VLOutputWithPast(ModelOutput):
     attentions: Optional[Tuple[torch.FloatTensor]] = None
     rope_deltas: Optional[torch.LongTensor] = None
 
+
+@dataclass
+class Qwen2VLMultiTaskOutput(ModelOutput):
+    """
+    多任务输出，包含token预测和数值回归
+    """
+    loss: Optional[torch.FloatTensor] = None
+    lm_loss: Optional[torch.FloatTensor] = None
+    regression_loss: Optional[torch.FloatTensor] = None
+    logits: Optional[torch.FloatTensor] = None
+    regression_value: Optional[torch.FloatTensor] = None
+    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    attentions: Optional[Tuple[torch.FloatTensor]] = None
+    rope_deltas: Optional[torch.Tensor] = None
+    spec_embeds: Optional[torch.FloatTensor] = None
+    euc_embeds: Optional[torch.FloatTensor] = None
+    hyp_embeds: Optional[torch.FloatTensor] = None
+    sph_embeds: Optional[torch.FloatTensor] = None
 
 
 
@@ -917,8 +937,52 @@ class AstroQwen2VLFull(Qwen2VLPreTrainedModel, GenerationMixin):
         self.euc_token_id = 79607 # euc token is þ
         self.hyp_token_id = 65013 # hyp token is æ
         self.sph_token_id = 38118 # sph token is ø
+
+        self.spec_norm = nn.LayerNorm(config.hidden_size)
+        self.struc_norm = nn.LayerNorm(config.hidden_size)
+
+        self.spec_scale = nn.Parameter(torch.ones(1) * 0.1)  # 初始值设为0.1
+        self.struc_scale = nn.Parameter(torch.ones(1) * 0.1)
+
+        self.gradient_clip_val = 1.0
+
+        nn.init.xavier_uniform_(self.spec_projector.weight, gain=0.01)  # 使用较小的gain值
+        nn.init.xavier_uniform_(self.struc_projector.weight, gain=0.01)
+
         # Initialize weights and apply final processing
         self.post_init()
+        self._init_multimodal_weights()
+    
+    def _init_multimodal_weights(self):
+        """使用float32进行权重初始化"""
+        # 确保在float32下进行初始化
+        with torch.no_grad():
+            # 使用正交初始化
+            spec_weight = torch.empty(self.spec_projector.weight.shape, dtype=torch.float32)
+            struc_weight = torch.empty(self.struc_projector.weight.shape, dtype=torch.float32)
+            
+            nn.init.orthogonal_(spec_weight)
+            nn.init.orthogonal_(struc_weight)
+            
+            # 缩放权重
+            spec_weight.mul_(0.1)
+            struc_weight.mul_(0.1)
+            
+            # 赋值回projector
+            self.spec_projector.weight.data.copy_(spec_weight)
+            self.struc_projector.weight.data.copy_(struc_weight)
+    
+    def _convert_multimodal_dtype(self, config):
+        """根据配置转换模型数据类型"""
+        dtype = getattr(torch, config.torch_dtype) if hasattr(config, 'torch_dtype') else torch.bfloat16
+        
+        # 转换projector和norm层的数据类型
+        self.spec_projector.to(dtype)
+        self.struc_projector.to(dtype)
+        self.spec_norm.to(dtype)
+        self.struc_norm.to(dtype)
+        self.spec_scale.data = self.spec_scale.data.to(dtype)
+        self.struc_scale.data = self.struc_scale.data.to(dtype)
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -1176,6 +1240,7 @@ class AstroQwen2VLFull(Qwen2VLPreTrainedModel, GenerationMixin):
 
         if inputs_embeds is None:
             inputs_embeds = self.model.embed_tokens(input_ids)
+            model_dtype = inputs_embeds.dtype  # 获取模型当前使用的dtype
             if pixel_values is not None:
                 pixel_values = pixel_values.type(self.visual.get_dtype())
                 image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
@@ -1185,27 +1250,67 @@ class AstroQwen2VLFull(Qwen2VLPreTrainedModel, GenerationMixin):
                 inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
             
             if spec_features is not None:
-                spec_embeds = self.spec_projector(spec_features)
+                # 转换到float32进行处理
+                spec_features = spec_features.to(torch.float32)
+                spec_features = F.normalize(spec_features, p=2, dim=-1)
+                
+                # 投影和归一化（在float32下）
+                with torch.amp.autocast("cuda", enabled=False):
+                    spec_embeds = self.spec_projector.to(torch.float32)(spec_features)
+                    spec_embeds = self.spec_norm.to(torch.float32)(spec_embeds)
+                    spec_embeds = spec_embeds * self.spec_scale.to(torch.float32)
+                
+                # 转回模型dtype并替换嵌入
+                spec_embeds = spec_embeds.to(model_dtype)
                 spec_mask = (input_ids == self.spec_token_id).unsqueeze(-1).expand_as(inputs_embeds)
-                spec_embeds = spec_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(spec_mask, spec_embeds)
 
             if euc_features is not None:
-                euc_embeds = self.struc_projector(euc_features)
+                # 转换到float32进行处理
+                euc_features = euc_features.to(torch.float32)
+                euc_features = F.normalize(euc_features, p=2, dim=-1)
+                
+                # 投影和归一化（在float32下）
+                with torch.amp.autocast("cuda", enabled=False):
+                    euc_embeds = self.struc_projector.to(torch.float32)(euc_features)
+                    euc_embeds = self.struc_norm.to(torch.float32)(euc_embeds)
+                    euc_embeds = euc_embeds * self.struc_scale.to(torch.float32)
+                
+                # 转回模型dtype并替换嵌入
+                euc_embeds = euc_embeds.to(model_dtype)
                 euc_mask = (input_ids == self.euc_token_id).unsqueeze(-1).expand_as(inputs_embeds)
-                euc_embeds = euc_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(euc_mask, euc_embeds)
 
             if hyp_features is not None:
-                hyp_embeds = self.struc_projector(hyp_features)
+                # 转换到float32进行处理
+                hyp_features = hyp_features.to(torch.float32)
+                hyp_features = F.normalize(hyp_features, p=2, dim=-1)
+                
+                # 投影和归一化（在float32下）
+                with torch.amp.autocast("cuda", enabled=False):
+                    hyp_embeds = self.struc_projector.to(torch.float32)(hyp_features)
+                    hyp_embeds = self.struc_norm.to(torch.float32)(hyp_embeds)
+                    hyp_embeds = hyp_embeds * self.struc_scale.to(torch.float32)
+                
+                # 转回模型dtype并替换嵌入
+                hyp_embeds = hyp_embeds.to(model_dtype)
                 hyp_mask = (input_ids == self.hyp_token_id).unsqueeze(-1).expand_as(inputs_embeds)
-                hyp_embeds = hyp_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(hyp_mask, hyp_embeds)
 
             if sph_features is not None:
-                sph_embeds = self.struc_projector(sph_features)
+                # 转换到float32进行处理
+                sph_features = sph_features.to(torch.float32)
+                sph_features = F.normalize(sph_features, p=2, dim=-1)
+                
+                # 投影和归一化（在float32下）
+                with torch.amp.autocast("cuda", enabled=False):
+                    sph_embeds = self.struc_projector.to(torch.float32)(sph_features)
+                    sph_embeds = self.struc_norm.to(torch.float32)(sph_embeds)
+                    sph_embeds = sph_embeds * self.struc_scale.to(torch.float32)
+                
+                # 转回模型dtype并替换嵌入
+                sph_embeds = sph_embeds.to(model_dtype)
                 sph_mask = (input_ids == self.sph_token_id).unsqueeze(-1).expand_as(inputs_embeds)
-                sph_embeds = sph_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(sph_mask, sph_embeds)
 
             if pixel_values_videos is not None:
@@ -1214,6 +1319,9 @@ class AstroQwen2VLFull(Qwen2VLPreTrainedModel, GenerationMixin):
                 video_mask = (input_ids == self.config.video_token_id).unsqueeze(-1).expand_as(inputs_embeds)
                 video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+
+            # 12. 确保所有特征都在合理范围内
+            inputs_embeds = torch.clip(inputs_embeds, -100, 100)  # 防止数值溢出
 
             if attention_mask is not None:
                 attention_mask = attention_mask.to(inputs_embeds.device)
@@ -1251,13 +1359,17 @@ class AstroQwen2VLFull(Qwen2VLPreTrainedModel, GenerationMixin):
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
-        return Qwen2VLCausalLMOutputWithPast(
+        return Qwen2VLMultiTaskOutput(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             rope_deltas=rope_deltas,
+            spec_embeds = spec_embeds,
+            euc_embeds = euc_embeds,
+            sph_embeds = sph_embeds,
+            hyp_embeds = hyp_embeds
         )
 
     def prepare_inputs_for_generation(
@@ -1357,6 +1469,318 @@ class AstroQwen2VLFull(Qwen2VLPreTrainedModel, GenerationMixin):
 
 
 
+class AstroQwen2VLFullMultiTask(AstroQwen2VLFull):
+    def __init__(self, config):
+        super().__init__(config)
+        
+        # 添加回归头
+        self.regression_head = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(config.hidden_size, 1)
+        )
+        
+        # 初始化为float32
+        self.regression_head = self.regression_head.to(torch.float32)
+        
+        # 添加损失权重参数
+        self.lm_weight = nn.Parameter(torch.ones(1, dtype=torch.float32))
+        self.regression_weight = nn.Parameter(torch.ones(1, dtype=torch.float32))
+        
+        # 回归损失函数
+        self.regression_loss = nn.SmoothL1Loss()  # 使用Huber Loss提高稳定性
+        
+        # 初始化后处理
+        self._init_regression_weights()
+    
+    def _init_regression_weights(self):
+        """初始化回归头的权重"""
+        for module in self.regression_head.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_normal_(module.weight, gain=0.01)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+    
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        regression_labels: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        **kwargs
+    ) -> Union[Tuple, Qwen2VLMultiTaskOutput]:
+        
+        # 获取原始输出
+        outputs = super().forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            labels=labels,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=True,
+            return_dict=True,
+            **kwargs
+        )
+        
+        # 获取最后一层的隐藏状态
+        hidden_states = outputs.hidden_states[-1]
+        
+        # 对于回归任务，我们只使用最后一个非padding位置的隐藏状态
+        if attention_mask is not None:
+            # import pudb;pu.db;
+            # 找到每个序列中最后一个非padding位置
+            last_hidden_state_indices = attention_mask.sum(1) - 1
+            batch_indices = torch.arange(hidden_states.size(0), device=hidden_states.device)
+            
+            last_hidden_states = hidden_states[batch_indices, last_hidden_state_indices]
+        else:
+            last_hidden_states = hidden_states[:, -1]
+        
+        # 计算回归值（在float32精度下）
+        with torch.amp.autocast("cuda", enabled=False):
+            last_hidden_states = last_hidden_states.to(torch.float32)
+            regression_value = self.regression_head(last_hidden_states)
+        
+        # 计算损失
+        lm_loss = outputs.loss if labels is not None else None
+        regression_loss = None
+        total_loss = None
+        
+        if regression_labels is not None and lm_loss is not None:
+            # 确保在相同设备和dtype上计算
+            regression_labels = regression_labels.to(regression_value.device)
+            regression_labels = regression_labels.to(torch.float32)
+            
+            # 计算回归损失
+            regression_loss = self.regression_loss(regression_value.squeeze(), regression_labels)
+            
+            # 使用动态权重合并损失
+            lm_weight = F.softplus(self.lm_weight)  # 确保权重为正
+            regression_weight = F.softplus(self.regression_weight)
+            
+            # 归一化权重
+            total_weight = lm_weight + regression_weight
+            lm_weight = lm_weight / total_weight
+            regression_weight = regression_weight / total_weight
+            
+            # 计算总损失
+            total_loss = lm_weight * lm_loss + regression_weight * regression_loss
+        
+        # 将回归值转换回模型的dtype
+        regression_value = regression_value.to(outputs.logits.dtype)
+        
+        if not return_dict:
+            outputs = (total_loss,) + (lm_loss, regression_loss, outputs.logits, regression_value) + outputs[1:]
+            return outputs
+        
+        return Qwen2VLMultiTaskOutput(
+            loss=total_loss,
+            lm_loss=lm_loss,
+            regression_loss=regression_loss,
+            logits=outputs.logits,
+            regression_value=regression_value,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            rope_deltas=outputs.rope_deltas
+        )
+    
+    def generate_regression(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs
+    ) -> torch.FloatTensor:
+        """
+        直接生成回归值而不是token
+        """
+        # 获取hidden states
+        with torch.no_grad():
+            outputs = self.forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True,
+                **kwargs
+            )
+            
+            # 返回回归值
+            return outputs.regression_value
+
+
+class AstroQwen2VLFullResidual(AstroQwen2VLFull):
+    def __init__(self, config):
+        super().__init__(config)
+        
+        # 添加回归头
+        self.regression_head = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(config.hidden_size, 1)
+        )
+        
+        # 初始化为float32
+        self.regression_head = self.regression_head.to(torch.float32)
+        
+        # 添加损失权重参数
+        self.lm_weight = nn.Parameter(torch.ones(1, dtype=torch.float32))
+        self.regression_weight = nn.Parameter(torch.ones(1, dtype=torch.float32))
+        
+        # 回归损失函数
+        self.regression_loss = nn.SmoothL1Loss()  # 使用Huber Loss提高稳定性
+        
+        # 初始化后处理
+        self._init_regression_weights()
+    
+    def _init_regression_weights(self):
+        """初始化回归头的权重"""
+        for module in self.regression_head.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_normal_(module.weight, gain=0.01)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+    
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        regression_labels: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        **kwargs
+    ) -> Union[Tuple, Qwen2VLMultiTaskOutput]:
+        
+        # 获取原始输出
+        outputs = super().forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            labels=labels,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=True,
+            return_dict=True,
+            **kwargs
+        )
+        
+        # 获取最后一层的隐藏状态
+        hidden_states = outputs.hidden_states[-1]
+
+        # 获取初始的embeds
+        euc_embeds = outputs.euc_embeds
+        hyp_embeds = outputs.hyp_embeds
+        spec_embeds = outputs.spec_embeds
+        sph_embeds = outputs.sph_embeds
+        
+        # 对于回归任务，我们只使用最后一个非padding位置的隐藏状态
+        if attention_mask is not None:
+            # 简单版本（假设每个序列都有目标token）
+            target_token_id = 77091
+            token_mask = (input_ids == target_token_id)
+            last_token_indices = torch.where(token_mask)[1].reshape(input_ids.size(0), -1)[:, -1]
+            # print(last_token_indices)
+            last_hidden_states = hidden_states[torch.arange(hidden_states.size(0), device=hidden_states.device), last_token_indices]
+            
+        else:
+            last_hidden_states = hidden_states[:, -1]
+        
+        # do the residual
+        last_hidden_states = last_hidden_states + euc_embeds + hyp_embeds + spec_embeds + sph_embeds
+
+        # 计算回归值（在float32精度下）
+        with torch.amp.autocast("cuda", enabled=False):
+            last_hidden_states = last_hidden_states.to(torch.float32)
+            regression_value = self.regression_head(last_hidden_states)
+        
+        # 计算损失
+        lm_loss = outputs.loss if labels is not None else None
+        regression_loss = None
+        total_loss = None
+        
+        if regression_labels is not None and lm_loss is not None:
+            # 确保在相同设备和dtype上计算
+            regression_labels = regression_labels.to(regression_value.device)
+            regression_labels = regression_labels.to(torch.float32)
+            
+            # 计算回归损失
+            regression_loss = self.regression_loss(regression_value.squeeze(), regression_labels)
+            
+            # 使用动态权重合并损失
+            lm_weight = F.softplus(self.lm_weight)  # 确保权重为正
+            regression_weight = F.softplus(self.regression_weight)
+            
+            # 归一化权重
+            total_weight = lm_weight + regression_weight
+            lm_weight = lm_weight / total_weight
+            regression_weight = regression_weight / total_weight
+            
+            # 计算总损失
+            total_loss = lm_weight * lm_loss + regression_weight * regression_loss
+        
+        # 将回归值转换回模型的dtype
+        regression_value = regression_value.to(outputs.logits.dtype)
+        
+        if not return_dict:
+            outputs = (total_loss,) + (lm_loss, regression_loss, outputs.logits, regression_value) + outputs[1:]
+            return outputs
+        
+        return Qwen2VLMultiTaskOutput(
+            loss=total_loss,
+            lm_loss=lm_loss,
+            regression_loss=regression_loss,
+            logits=outputs.logits,
+            regression_value=regression_value,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            rope_deltas=outputs.rope_deltas
+        )
+    
+    def generate_regression(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs
+    ) -> torch.FloatTensor:
+        """
+        直接生成回归值而不是token
+        """
+        # 获取hidden states
+        with torch.no_grad():
+            outputs = self.forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True,
+                **kwargs
+            )
+            
+            # 返回回归值
+            return outputs.regression_value   
+
+
+
+
 
 
 
@@ -1365,4 +1789,4 @@ if __name__ == "__main__":
 
     # check model loading, the number head is new added
     checkpoint = "/mnt/data/CVPR2025/task1_data/Qwen2-VL-2B-Instruct"
-    model = AstroQwen2VL.from_pretrained(checkpoint)
+    model = AstroQwen2VLFullMultiTask.from_pretrained(checkpoint)
