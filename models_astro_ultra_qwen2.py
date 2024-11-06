@@ -139,7 +139,7 @@ class AstroAdapter(nn.Module):
 
     def forward(self, hidden_states):
         # Get routing weights
-        router_logits = self.router(hidden_states)
+        router_logits = self.router(hidden_states)  # [batch_size, seq_len, num_experts]
         router_probs = F.softmax(router_logits / self.temperature, dim=-1)
         
         # Get expert outputs
@@ -147,10 +147,16 @@ class AstroAdapter(nn.Module):
         for expert in self.experts:
             expert_output = expert(hidden_states)
             expert_outputs.append(expert_output)
-        expert_outputs = torch.stack(expert_outputs, dim=1)
+        expert_outputs = torch.stack(expert_outputs, dim=1)  # [batch_size, num_experts, seq_len, hidden_size]
+        
+        # Reshape router_probs to match expert_outputs dimensions
+        # [batch_size, seq_len, num_experts] -> [batch_size, num_experts, seq_len, 1]
+        router_probs = router_probs.permute(0, 2, 1).unsqueeze(-1)
         
         # Combine expert outputs
-        combined_output = torch.sum(expert_outputs * router_probs.unsqueeze(-1), dim=1)
+        # expert_outputs: [batch_size, num_experts, seq_len, hidden_size]
+        # router_probs: [batch_size, num_experts, seq_len, 1]
+        combined_output = torch.sum(expert_outputs * router_probs, dim=1)  # [batch_size, seq_len, hidden_size]
         
         return combined_output, router_logits
 
@@ -161,7 +167,7 @@ class AstroQwen2VLDecoderLayer(Qwen2VLDecoderLayer):
         super().__init__(config, layer_idx)
         
         # Store original FFN weights before replacing
-        orig_mlp_state = {}
+        orig_mlp_state = {} 
         for name, param in self.mlp.named_parameters():
             orig_mlp_state[name] = param.data.clone()
         
@@ -211,27 +217,30 @@ class AstroQwen2VLDecoderLayer(Qwen2VLDecoderLayer):
 
 
 class AstroQwen2VLModel(Qwen2VLModel):
-    """Qwen2VL model with MoE enhanced decoder layers"""
+    """Qwen2VL model with MoE enhanced decoder layers alternating with original layers"""
     def __init__(self, config):
         super().__init__(config)
-        # Replace standard decoder layers with Astro layers
+        
+        # Create a mixture of original and MoE layers
         self.layers = nn.ModuleList([
-            AstroQwen2VLDecoderLayer(config, i) for i in range(config.num_hidden_layers)
+            AstroQwen2VLDecoderLayer(config, i) if i % 4 == 0  # 每隔4层使用MoE
+            else Qwen2VLDecoderLayer(config, i)
+            for i in range(config.num_hidden_layers)
         ])
 
     def forward(self, *args, **kwargs):
         outputs = super().forward(*args, **kwargs)
         
-        # Extract router logits if attention outputs are requested
+        # Extract router logits only from MoE layers
         router_logits = []
         if kwargs.get("output_attentions", False):
-            for layer_outputs in outputs.attentions:
-                if len(layer_outputs) > 2:
-                    router_logits.append(layer_outputs[-1])
+            for i, layer_outputs in enumerate(outputs.attentions):
+                if i % 4 == 0:  # 只从MoE层收集router_logits
+                    if len(layer_outputs) > 2:
+                        router_logits.append(layer_outputs[-1])
                     
         outputs.router_logits = router_logits if router_logits else None
         return outputs
-
 class AstroQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
     """Main model class with MoE enhancement and multi-modal projectors"""
     def __init__(self, config):
@@ -256,6 +265,10 @@ class AstroQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
 
         self.spec_scale = nn.Parameter(torch.ones(1) * 0.1)  # 初始值设为0.1
         self.struc_scale = nn.Parameter(torch.ones(1) * 0.1)
+
+        # 添加损失权重参数
+        self.lm_weight = nn.Parameter(torch.ones(1, dtype=torch.float32))
+        self.regression_weight = nn.Parameter(torch.ones(1, dtype=torch.float32))
         
         # Add regression head
         self.num_head = nn.Sequential(
@@ -263,6 +276,8 @@ class AstroQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
             nn.GELU(),
             nn.Linear(config.hidden_size, 1)
         )
+
+        self.regression_loss = nn.SmoothL1Loss()  # 使用Huber Loss提高稳定性
         
         # Initialize new components
         self._init_new_weights()
@@ -308,6 +323,9 @@ class AstroQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
         output_hidden_states=None,
         return_dict=None,
         pixel_values=None,
+        pixel_values_videos = None,
+        image_grid_thw = None,
+        video_grid_thw = None,
         spec_features=None,
         euc_features = None,
         hyp_features = None,
@@ -387,7 +405,7 @@ class AstroQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
             
             # Process vision features (from parent class)
             if pixel_values is not None:
-                image_embeds = self.process_vision_features(pixel_values)
+                image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
                 image_mask = (input_ids == self.config.image_token_id).unsqueeze(-1)
                 inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
             
@@ -413,9 +431,9 @@ class AstroQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
         logits = logits.float()
 
         # Get regression value if needed
-        regression_value = None
-        if answers is not None:
-            regression_value = self.regression_head(hidden_states[:, -1])
+        # regression_value = None
+        # if answers is not None:
+        #     regression_value = self.regression_head(hidden_states[:, -1])
 
         # Calculate losses
         loss = None
@@ -430,10 +448,11 @@ class AstroQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
             # Add regression loss if applicable
             if answers is not None:
                 # find the num token in label
-                num_mask = (shift_labels == self.num_token_id).unsqueeze(-1).expand_as(shift_logits)
-
-                num_logits = shift_logits[num_mask] 
+                shift_hidden_states = hidden_states[...,:-1, :].contiguous()
+                num_mask = (shift_labels == self.num_token_id).unsqueeze(-1).expand_as(shift_hidden_states)
+                num_logits = shift_hidden_states[num_mask].view(-1, shift_hidden_states.shape[-1]) 
                 if euc_embeds is not None:
+                    # import pudb;pu.db;
                     num_logits += euc_embeds
                 if hyp_embeds is not None:
                     num_logits += hyp_embeds
@@ -447,10 +466,10 @@ class AstroQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                 # 计算回归值（在float32精度下）
                 with torch.amp.autocast("cuda", enabled=False):
                     num_logits = num_logits.to(torch.float32)
-                    regression_value = self.regression_head(num_logits)
+                    regression_value = self.num_head(num_logits)
                 
                 # 确保在相同设备和dtype上计算
-                answers = answers.to(regression_value.device)
+                answers = torch.tensor(answers).to(regression_value.device)
                 answers = answers.to(torch.float32)
 
                  # 计算回归损失

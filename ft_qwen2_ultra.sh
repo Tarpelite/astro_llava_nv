@@ -1,0 +1,13 @@
+python ft_qwen2_ultra.py \
+    --model_path /mnt/data/CVPR2025/task1_data/Qwen2-VL-2B-Instruct \
+    --train_regression_data /mnt/data/CVPR2025/task1_data/data1105/regression/train_no_classification_addfeat.hdf5 \
+    --train_classification_data /mnt/data/CVPR2025/task1_data/data1105/classification/train_no_classification_addfeat_task3.hdf5 \
+    --eval_regression_data /mnt/data/CVPR2025/task1_data/data1105/regression/test_no_classification_addfeat.hdf5 \
+    --eval_classification_data /mnt/data/CVPR2025/task1_data/data1105/classification/test_no_classification_addfeat_task3.hdf5 \
+    --image_dir /mnt/data/CVPR2025/task1_data/images/images \
+    --template_path template_ultra_qwen2vl_classification.json \
+    --output_dir /mnt/data/CVPR2025/task1_data/ckpts/ft_qwen2VL_2B_ultra \
+    --learning_rate 2e-5 \
+    --per_device_train_batch_size 1 \
+    --gradient_accumulation_steps 1 \
+    --num_train_epochs 3

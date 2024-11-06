@@ -79,7 +79,8 @@ class Qwen2VLBaseDataset(Dataset):
         if task_type in self.regression_tasks:
             answer_key = self.answer_mapping[task_type]
             answer = self._get_value(row_data, answer_key)
-            answer_text = f"{answer:.6f}"
+            # answer_text = f"{answer:.6f}"
+            answer_text = " num"
         else:
             task_key = task_type.replace('task3_', '').replace("_", "-")
             answer = int(row_data[task_key])
@@ -157,7 +158,7 @@ class Qwen2VLTrainingDataset(Qwen2VLBaseDataset):
         image_dir: str,
         template_path: str,
         processor,
-        num_questions: int = 5,
+        num_questions: int = 1,
         max_length: int = 512,
         max_samples: Optional[int] = None,
     ):
@@ -378,6 +379,7 @@ def collate_fn(batch: List[Dict]) -> Dict:
             labels[i, :] = -100
 
     batch_inputs["labels"] = labels
+    batch_inputs["answers"] = all_answers
     
     output = {
         'target_ids': target_ids,
