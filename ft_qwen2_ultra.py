@@ -2,6 +2,7 @@ import os
 import argparse
 import logging
 from typing import Dict, List, Tuple
+from collections import defaultdict
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoProcessor, get_linear_schedule_with_warmup
@@ -14,9 +15,11 @@ from torch.utils.tensorboard import SummaryWriter
 from sklearn.metrics import r2_score, accuracy_score, f1_score
 # import wandb
 import re
+import math
+from tqdm import tqdm
 
 from models_astro_ultra_qwen2 import AstroQwen2VLForConditionalGeneration
-from dataset_ultra_qwen2vl import Qwen2VLTrainingDataset, Qwen2VLEvaluationDataset, collate_fn
+from dataset_ultra_qwen2vl import Qwen2VLTrainingDataset, Qwen2VLEvaluationDataset, collate_fn, Qwen2VLClassificationEvaluationDataset, Qwen2VLRegressionEvaluationDataset
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -36,8 +39,8 @@ def parse_args():
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--train_regression_data", type=str, required=True)
     parser.add_argument("--train_classification_data", type=str, required=True)
-    parser.add_argument("--eval_regression_data", type=str, required=True)
-    parser.add_argument("--eval_classification_data", type=str, required=True)
+    # parser.add_argument("--eval_regression_data", type=str, required=True)
+    # parser.add_argument("--eval_classification_data", type=str, required=True)
     parser.add_argument("--image_dir", type=str, required=True)
     parser.add_argument("--template_path", type=str, required=True)
     parser.add_argument("--output_dir", type=str, default="outputs")
@@ -56,7 +59,20 @@ def parse_args():
     parser.add_argument("--eval_steps", type=int, default=500)
     parser.add_argument("--logging_steps", type=int, default=100)
     parser.add_argument("--save_steps", type=int, default=1000)
-    parser.add_argument("--max_eval_samples", type=int, default=None)
+    
+
+    parser.add_argument("--regression_eval_dir", type=str, required=True,
+                       help="Directory containing split regression evaluation files")
+    parser.add_argument("--classification_eval_dir", type=str, required=True,
+                       help="Path to classification evaluation HDF5 file")
+    parser.add_argument("--eval_regression_tasks", nargs='+', 
+                       help="Specific regression tasks to evaluate")
+    parser.add_argument("--eval_classification_tasks", nargs='+',
+                       help="Specific classification tasks to evaluate")
+    parser.add_argument("--samples_per_regression_task", type=int, default=None,
+                       help="Number of samples to evaluate per regression task")
+    parser.add_argument("--samples_per_classification_task", type=int, default=None,
+                       help="Number of samples to evaluate per classification task")
 
     args = parser.parse_args()
 
@@ -65,10 +81,10 @@ def parse_args():
         "regression": args.train_regression_data,
         "classification": args.train_classification_data
     }
-    args.eval_data = {
-        "regression": args.eval_regression_data,
-        "classification": args.eval_classification_data
-    }
+    # args.eval_data = {
+    #     "regression": args.eval_regression_data,
+    #     "classification": args.eval_classification_data
+    # }
     
     return args
 
@@ -130,45 +146,98 @@ def extract_number(text: str) -> float:
         return float('nan')
 
 
-def evaluate_regression(model, eval_dataloader, processor, args):
+def evaluate_regression(model, eval_dataloader, processor, args, global_step):
     """评估回归任务"""
     model.eval()
     task_metrics = {}
+    task_predictions = defaultdict(list)
+    task_labels = defaultdict(list)
     
-    for task in model.regression_tasks:
-        predictions = []
-        labels = []
-        
-        for batch in eval_dataloader:
-            with torch.no_grad():
-                # 第一步:获取token生成结果
-                generated_ids = model.generate(
-                    **batch["processed_inputs"],
-                    max_new_tokens=5,
-                    do_sample=False
-                )
-                generated_text = processor.batch_decode(generated_ids)
+    print(f"Evaluating regression tasks, total batches: {len(eval_dataloader)}")
+    for batch in eval_dataloader:
+        with torch.no_grad():
+            batch_tasks = batch['task_types']
+            print(batch["text_sequences"][0][0])
+            
+            # 一次只生成一个token
+            for i in range(5):  # 最多生成5个token
+                if i == 0:
+                    # 第一个token
+                    outputs = model.generate(
+                        **batch["processed_inputs"],
+                        max_new_tokens=1,
+                        do_sample=False,
+                        output_hidden_states=True,
+                        return_dict_in_generate=True,
+                        output_scores=True
+                    )
+                    current_ids = outputs.sequences
+                    current_hidden = outputs.hidden_states[-1][-1]  # 最后一层的最后一个token的hidden states
+                else:
+                    # 后续token，需要使用之前的结果作为输入
+                    new_inputs = batch["processed_inputs"].copy()
+                    new_inputs["input_ids"] = current_ids
+                    new_inputs["attention_mask"] = torch.ones_like(current_ids)
+                    
+                    outputs = model.generate(
+                        **new_inputs,
+                        max_new_tokens=1,
+                        do_sample=False,
+                        output_hidden_states=True,
+                        return_dict_in_generate=True,
+                        output_scores=True
+                    )
+                    current_ids = outputs.sequences
+                    current_hidden = outputs.hidden_states[-1][-1]
                 
-                # 第二步:对于数值预测使用回归头
-                for text in generated_text:
-                    if " num" in text:
-                        # 获取最后一个token的logits
-                        last_token_logits = model.get_last_token_logits(generated_ids)
-                        # 添加特征logits
-                        logits = last_token_logits + model.get_feature_logits(batch)
-                        # 使用回归头预测
-                        pred = model.num_head(logits).squeeze()
-                        predictions.append(pred.item())
-                    else:
-                        # 从生成文本中提取数值
-                        pred = extract_number(text)
-                        predictions.append(pred)
+                # 检查每个样本是否生成了" num"
+                for batch_idx, (ids, task) in enumerate(zip(current_ids, batch_tasks)):
+                    last_token = ids[-1].item()
+                    if last_token == model.num_token_id:
+                        # 如果是" num"，立即使用regression head进行预测
+                        pred = model.predict_number(
+                            input_ids=ids.unsqueeze(0),
+                            hidden_states=current_hidden[batch_idx].unsqueeze(0),
+                            spec_features=batch["processed_inputs"].get('spec_features')[batch_idx:batch_idx+1] if 'spec_features' in batch["processed_inputs"] else None,
+                            euc_features=batch["processed_inputs"].get('euc_features')[batch_idx:batch_idx+1] if 'euc_features' in batch["processed_inputs"] else None,
+                            hyp_features=batch["processed_inputs"].get('hyp_features')[batch_idx:batch_idx+1] if 'hyp_features' in batch["processed_inputs"] else None,
+                            sph_features=batch["processed_inputs"].get('sph_features')[batch_idx:batch_idx+1] if 'sph_features' in batch["processed_inputs"] else None
+                        )
+                        task_predictions[task].append(pred.item())
+                        task_labels[task].append(batch['answers'][batch_idx])
                         
-                labels.extend(batch['labels'].cpu().numpy())
+                        # 从当前batch中移除已处理的样本
+                        mask = torch.ones(len(batch_tasks), dtype=torch.bool)
+                        mask[batch_idx] = False
+                        batch_tasks = [t for t, m in zip(batch_tasks, mask) if m]
+                        for k in batch["processed_inputs"]:
+                            if isinstance(batch["processed_inputs"][k], torch.Tensor):
+                                batch["processed_inputs"][k] = batch["processed_inputs"][k][mask]
+                
+                # 如果所有样本都已处理完，提前退出
+                if len(batch_tasks) == 0:
+                    break
+            
+            # 对于未生成" num"的样本，添加nan
+            for task in batch_tasks:
+                task_predictions[task].append(float('nan'))
+                task_labels[task].append(batch['answers'][0])  # 注意这里可能需要调整
+    
+    # 计算每个任务的指标
+    for task in task_predictions.keys():
+        predictions = np.array(task_predictions[task])
+        labels = np.array(task_labels[task])
         
         # 计算指标
-        mse = np.mean((np.array(predictions) - np.array(labels)) ** 2)
-        r2 = r2_score(labels, predictions)
+        mse = np.mean((predictions - labels) ** 2)
+        flag = np.any(np.isnan(predictions))
+        r2 = 0 if flag else r2_score(labels, predictions)
+        
+        print(f"\nTask: {task}")
+        print(f"Samples: {len(predictions)}")
+        print(f"Predictions (first 3): {predictions[:3]}")
+        print(f"Labels (first 3): {labels[:3]}")
+        print(f"MSE: {mse:.6f}, R2: {r2:.6f}")
         
         task_metrics[task] = {
             'mse': mse,
@@ -176,71 +245,98 @@ def evaluate_regression(model, eval_dataloader, processor, args):
         }
         
         # 记录到tensorboard
-        args.writer.add_scalar(f'{task}/mse', mse, args.global_step)
-        args.writer.add_scalar(f'{task}/r2', r2, args.global_step)
+        args.writer.add_scalar(f'{task}/mse', mse, global_step)
+        args.writer.add_scalar(f'{task}/r2', r2, global_step)
     
     return task_metrics
 
-def evaluate_classification(model, eval_dataloader, args):
+def evaluate_classification(model, eval_dataloader, args, global_step):
     """评估分类任务"""
     model.eval()
     task_metrics = {}
+    task_predictions = defaultdict(list)
+    task_labels = defaultdict(list)
     
-    def extract_class_label(text):
-        """从生成的文本中提取分类标签"""
-        # 寻找(a), (b), (c)等模式
-        matches = re.search(r'\(([a-z])\)', text.lower())
+    def extract_answer(text: str) -> str:
+        """
+        提取<|im_start|>assistant和<|im_end|>之间的回答内容
+        """
+        pattern = r'<\|im_start\|>assistant\s*(.*?)<\|im_end\|>'
+        match = re.search(pattern, text, re.DOTALL)  # re.DOTALL让.也能匹配换行符
+        if match:
+            return match.group(1).strip()
+        return ""
+    
+    def extract_class_label(answer: str) -> int:
+        """从回答中提取分类标签"""
+        if not answer:  # 如果答案为空
+            return -1
+            
+        # 在回答中寻找(a), (b), (c)等模式
+        matches = re.search(r'\(([a-z])\)', answer.lower())
         if matches:
-            label_char = matches.group(1)
-            # 将a,b,c转换为0,1,2
-            return ord(label_char) - ord('a')
-        return None
+            return ord(matches.group(1)) - ord('a')
+        return -1
     
-    for task in model.classification_tasks:
-        predictions = []
-        labels = []
-        
-        for batch in eval_dataloader:
-            with torch.no_grad():
-                # 使用生成来获取答案
-                generated_ids = model.generate(
-                    **batch["processed_inputs"],
-                    max_new_tokens=5,
-                    do_sample=False
-                )
-                generated_text = args.processor.batch_decode(generated_ids)
+    print(f"Evaluating classification tasks, total batches: {len(eval_dataloader)}")
+    for batch in eval_dataloader:
+        with torch.no_grad():
+            batch_tasks = batch['task_types']
+            
+            # 生成预测结果
+            generated_ids = model.generate(
+                **batch["processed_inputs"],
+                max_new_tokens=5,
+                do_sample=False
+            )
+            generated_texts = args.processor.batch_decode(generated_ids)
+            
+            # 处理每个样本的预测结果
+            for i, (text, task) in enumerate(zip(generated_texts, batch_tasks)):
+                # 提取assistant的回答
+                answer = extract_answer(text)
+                print(f"Task: {task}")
+                print(f"Full text: {text}")
+                print(f"Extracted answer: {answer}")
                 
-                # 从生成的文本中提取预测标签
-                for text in generated_text:
-                    pred_label = extract_class_label(text)
-                    if pred_label is not None:
-                        predictions.append(pred_label)
-                    else:
-                        # 如果无法提取标签，添加一个默认值或跳过
-                        predictions.append(-1)
-                
-                labels.extend(batch['labels'].cpu().numpy())
+                # 从回答中提取标签
+                pred_label = extract_class_label(answer)
+                task_predictions[task].append(pred_label)
+                task_labels[task].append(batch['answers'][i])
+    
+    # 计算每个任务的指标
+    for task in task_predictions.keys():
+        predictions = np.array(task_predictions[task])
+        labels = np.array(task_labels[task])
         
         # 过滤掉无效预测
-        valid_indices = np.array(predictions) != -1
-        predictions = np.array(predictions)[valid_indices]
-        labels = np.array(labels)[valid_indices]
+        valid_indices = predictions != -1
+        valid_predictions = predictions[valid_indices]
+        valid_labels = labels[valid_indices]
         
-        if len(predictions) > 0:
-            acc = accuracy_score(labels, predictions)
-            f1 = f1_score(labels, predictions, average='weighted')
+        if len(valid_predictions) > 0:
+            acc = accuracy_score(valid_labels, valid_predictions)
+            f1 = f1_score(valid_labels, valid_predictions, average='weighted')
         else:
             acc = 0
             f1 = 0
             
+        print(f"\nTask: {task}")
+        print(f"Total samples: {len(predictions)}")
+        print(f"Valid samples: {len(valid_predictions)}")
+        print(f"Invalid samples: {len(predictions) - len(valid_predictions)}")
+        print(f"Accuracy: {acc:.4f}, F1: {f1:.4f}")
+        
         task_metrics[task] = {
             'accuracy': acc,
-            'f1': f1
+            'f1': f1,
+            'valid_ratio': len(valid_predictions) / len(predictions)
         }
         
         # 记录到tensorboard
-        args.writer.add_scalar(f'{task}/accuracy', acc, args.global_step)
-        args.writer.add_scalar(f'{task}/f1', f1, args.global_step)
+        args.writer.add_scalar(f'{task}/accuracy', acc, global_step)
+        args.writer.add_scalar(f'{task}/f1', f1, global_step)
+        args.writer.add_scalar(f'{task}/valid_ratio', len(valid_predictions) / len(predictions), global_step)
     
     return task_metrics
 
@@ -279,13 +375,13 @@ def train():
         processor=processor
     )
     
-    eval_dataset = Qwen2VLEvaluationDataset(
-        hdf5_paths=args.eval_data,
-        image_dir=args.image_dir,
-        template_path=args.template_path,
-        processor=processor,
-        max_regression_samples=args.max_eval_samples
-    )
+    # eval_dataset = Qwen2VLEvaluationDataset(
+    #     hdf5_paths=args.eval_data,
+    #     image_dir=args.image_dir,
+    #     template_path=args.template_path,
+    #     processor=processor,
+    #     max_regression_samples=args.max_eval_samples
+    # )
     
     train_dataloader = DataLoader(
         train_dataset,
@@ -294,8 +390,41 @@ def train():
         collate_fn=collate_fn
     )
     
-    eval_dataloader = DataLoader(
-        eval_dataset,
+    # eval_dataloader = DataLoader(
+    #     eval_dataset,
+    #     batch_size=args.per_device_eval_batch_size,
+    #     collate_fn=collate_fn
+    # )
+    # 替换原来的eval_dataset初始化
+    
+
+    eval_regression_dataset = Qwen2VLRegressionEvaluationDataset(
+        eval_dir=args.regression_eval_dir,
+        image_dir=args.image_dir,
+        template_path=args.template_path,
+        processor=processor,
+        max_samples_per_task=args.samples_per_regression_task,
+        selected_tasks=args.eval_regression_tasks
+    )
+
+    eval_classification_dataset = Qwen2VLClassificationEvaluationDataset(
+        eval_dir=args.classification_eval_dir,
+        image_dir=args.image_dir,
+        template_path=args.template_path,
+        processor=processor,
+        max_samples_per_task=args.samples_per_classification_task,
+        selected_tasks=args.eval_classification_tasks
+    )
+
+    # 创建两个dataloader
+    eval_regression_dataloader = DataLoader(
+        eval_regression_dataset,
+        batch_size=args.per_device_eval_batch_size,
+        collate_fn=collate_fn
+    )
+
+    eval_classification_dataloader = DataLoader(
+        eval_classification_dataset,
         batch_size=args.per_device_eval_batch_size,
         collate_fn=collate_fn
     )
@@ -315,8 +444,8 @@ def train():
     )
     
     # 准备训练
-    model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
-        model, optimizer, train_dataloader, eval_dataloader
+    model, optimizer, train_dataloader, eval_regression_dataloader, eval_classification_dataloader = accelerator.prepare(
+        model, optimizer, train_dataloader,  eval_regression_dataloader, eval_classification_dataloader
     )
     
     # 训练循环
@@ -331,9 +460,10 @@ def train():
     for epoch in range(args.num_train_epochs):
         model.train()
         
-        for step, batch in enumerate(train_dataloader):
+        for step, batch in enumerate(tqdm(train_dataloader)):
             with accelerator.accumulate(model):
                 # import pudb;pu.db;
+                # print(batch["text_sequences"][0][0])
                 outputs = model(**batch["processed_inputs"], return_dict=True)
                 loss = outputs.loss
                 print(loss)
@@ -350,12 +480,13 @@ def train():
                         args.writer.add_scalar('train/loss', loss.item(), global_step)
                         
                     # 评估
+                  
                     if global_step % args.eval_steps == 0:
                         reg_metrics = evaluate_regression(
-                            model, eval_dataloader, processor, args
+                            model, eval_regression_dataloader, processor, args, global_step
                         )
                         cls_metrics = evaluate_classification(
-                            model, eval_dataloader, args
+                            model, eval_classification_dataloader, args, global_step
                         )
                         
                         # 更新最佳指标并保存模型

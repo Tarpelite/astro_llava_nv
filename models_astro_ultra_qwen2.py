@@ -10,8 +10,10 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
     Qwen2VLPreTrainedModel,
     Qwen2VLModel,
     Qwen2VLConfig,
-    Qwen2VLDecoderLayer
+    Qwen2VLDecoderLayer,
+    _prepare_4d_causal_attention_mask_with_cache_position
 )
+from transformers.cache_utils import Cache, StaticCache
 
 
 
@@ -241,6 +243,7 @@ class AstroQwen2VLModel(Qwen2VLModel):
                     
         outputs.router_logits = router_logits if router_logits else None
         return outputs
+    
 class AstroQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
     """Main model class with MoE enhancement and multi-modal projectors"""
     def __init__(self, config):
@@ -331,6 +334,7 @@ class AstroQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
         hyp_features = None,
         sph_features = None,
         answers=None,
+        task_type_id=None,
         **kwargs
     ):
         if inputs_embeds is None:
@@ -338,6 +342,7 @@ class AstroQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
             model_dtype = inputs_embeds.dtype  # 获取模型当前使用的dtype
             # Process spectral features
 
+            spec_embeds = None
             if spec_features is not None:
                 # 转换到float32进行处理
                 spec_features = spec_features.to(torch.float32)
@@ -354,6 +359,7 @@ class AstroQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                 spec_mask = (input_ids == self.spec_token_id).unsqueeze(-1).expand_as(inputs_embeds)
                 inputs_embeds = inputs_embeds.masked_scatter(spec_mask, spec_embeds)
             
+            euc_embeds = None
             # Process structural features
             if euc_features is not None:
                 # 转换到float32进行处理
@@ -371,6 +377,7 @@ class AstroQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                 euc_mask = (input_ids == self.euc_token_id).unsqueeze(-1).expand_as(inputs_embeds)
                 inputs_embeds = inputs_embeds.masked_scatter(euc_mask, euc_embeds)
 
+            hyp_embeds = None
             if hyp_features is not None:
                 # 转换到float32进行处理
                 hyp_features = hyp_features.to(torch.float32)
@@ -387,6 +394,7 @@ class AstroQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                 hyp_mask = (input_ids == self.hyp_token_id).unsqueeze(-1).expand_as(inputs_embeds)
                 inputs_embeds = inputs_embeds.masked_scatter(hyp_mask, hyp_embeds)
 
+            sph_embeds = None
             if sph_features is not None:
                 # 转换到float32进行处理
                 sph_features = sph_features.to(torch.float32)
@@ -403,6 +411,7 @@ class AstroQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                 sph_mask = (input_ids == self.sph_token_id).unsqueeze(-1).expand_as(inputs_embeds)
                 inputs_embeds = inputs_embeds.masked_scatter(sph_mask, sph_embeds)
             
+            image_embeds = None
             # Process vision features (from parent class)
             if pixel_values is not None:
                 image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
@@ -422,7 +431,7 @@ class AstroQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=True,
-            **kwargs
+            # **kwargs
         )
 
         # Get language modeling logits
@@ -431,12 +440,13 @@ class AstroQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
         logits = logits.float()
 
         # Get regression value if needed
-        # regression_value = None
+        regression_value = None
         # if answers is not None:
         #     regression_value = self.regression_head(hidden_states[:, -1])
 
         # Calculate losses
         loss = None
+
         if labels is not None:
             
             # Language modeling loss
@@ -446,7 +456,7 @@ class AstroQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
             loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
             
             # Add regression loss if applicable
-            if answers is not None:
+            if answers is not None and task_type_id == 0:
                 # find the num token in label
                 shift_hidden_states = hidden_states[...,:-1, :].contiguous()
                 num_mask = (shift_labels == self.num_token_id).unsqueeze(-1).expand_as(shift_hidden_states)
@@ -472,8 +482,11 @@ class AstroQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                 answers = torch.tensor(answers).to(regression_value.device)
                 answers = answers.to(torch.float32)
 
-                 # 计算回归损失
-                reg_loss = self.regression_loss(regression_value.squeeze(), answers)
+                #  # 计算回归损失
+                # if regression_value.shape[0] == 0:
+                #     import pudb; pu.db;
+                print("regress_value: {} answers:{}".format(regression_value, answers))
+                reg_loss = self.regression_loss(regression_value.squeeze().view(-1), answers.view(-1))
                 
                 # 使用动态权重合并损失
                 lm_weight = F.softplus(self.lm_weight)  # 确保权重为正
@@ -501,9 +514,211 @@ class AstroQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
             regression_value=regression_value
         )
 
-    def prepare_inputs_for_generation(self, *args, **kwargs):
-        """Inherit generation behavior from parent class"""
-        return super().prepare_inputs_for_generation(*args, **kwargs)
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        cache_position=None,
+        position_ids=None,
+        use_cache=True,
+        pixel_values=None,
+        pixel_values_videos=None,
+        spec_features=None,
+        euc_features = None,
+        hyp_features = None,
+        sph_features = None,
+        image_grid_thw=None,
+        video_grid_thw=None,
+        **kwargs,
+    ):
+        # If we have cache: let's slice `input_ids` through `cache_position`, to keep only the unprocessed tokens
+        # Exception 1: when passing input_embeds, input_ids may be missing entries
+        # Exception 2: some generation methods do special slicing of input_ids, so we don't need to do it here
+        if past_key_values is not None:
+            if inputs_embeds is not None:  # Exception 1
+                input_ids = input_ids[:, -cache_position.shape[0] :]
+            elif input_ids.shape[1] != cache_position.shape[0]:  # Default case (the "else", a no op, is Exception 2)
+                input_ids = input_ids[:, cache_position]
+
+        rope_deltas = kwargs.get("rope_deltas", None)
+        if attention_mask is not None and position_ids is None:
+            if cache_position is None or (cache_position is not None and cache_position[0] == 0):
+                position_ids, rope_deltas = self.get_rope_index(
+                    input_ids, image_grid_thw, video_grid_thw, attention_mask
+                )
+            else:
+                batch_size, seq_length = input_ids.shape
+                delta = (
+                    cache_position[0] + rope_deltas if cache_position is not None and rope_deltas is not None else 0
+                )
+                position_ids = torch.arange(seq_length, device=input_ids.device)
+                position_ids = position_ids.view(1, -1).expand(batch_size, -1)
+                position_ids = position_ids.add(delta)
+                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+
+        if cache_position[0] != 0:
+            pixel_values = None
+            pixel_values_videos = None
+
+        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+        if inputs_embeds is not None and cache_position[0] == 0:
+            model_inputs = {"inputs_embeds": inputs_embeds, "input_ids": None}
+        else:
+            model_inputs = {"input_ids": input_ids, "inputs_embeds": None}
+
+        if isinstance(past_key_values, StaticCache) and attention_mask.ndim == 2:
+            if model_inputs["inputs_embeds"] is not None:
+                batch_size, sequence_length, _ = inputs_embeds.shape
+                device = inputs_embeds.device
+            else:
+                batch_size, sequence_length = input_ids.shape
+                device = input_ids.device
+
+            dtype = self.lm_head.weight.dtype
+            min_dtype = torch.finfo(dtype).min
+
+            attention_mask = _prepare_4d_causal_attention_mask_with_cache_position(
+                attention_mask,
+                sequence_length=sequence_length,
+                target_length=past_key_values.get_max_length(),
+                dtype=dtype,
+                device=device,
+                min_dtype=min_dtype,
+                cache_position=cache_position,
+                batch_size=batch_size,
+            )
+
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "past_key_values": past_key_values,
+                "use_cache": use_cache,
+                "attention_mask": attention_mask,
+                "pixel_values": pixel_values,
+                "pixel_values_videos": pixel_values_videos,
+                "spec_features": spec_features,
+                "euc_features": euc_features,
+                "hyp_features": hyp_features,
+                "sph_features": sph_features,
+                "image_grid_thw": image_grid_thw,
+                "video_grid_thw": video_grid_thw,
+                "rope_deltas": rope_deltas,
+            }
+        )
+        return model_inputs
+
+    def predict_number(
+            self,
+            input_ids: torch.LongTensor,
+            hidden_states: torch.FloatTensor,
+            spec_features: Optional[torch.FloatTensor] = None,
+            euc_features: Optional[torch.FloatTensor] = None, 
+            hyp_features: Optional[torch.FloatTensor] = None,
+            sph_features: Optional[torch.FloatTensor] = None
+            ) -> torch.FloatTensor:
+            """
+            Predict numerical values by combining token logits with multimodal features
+            
+            Args:
+                input_ids: Input token IDs including " num" token
+                hidden_states: Hidden states from model forward pass
+                spec_features: Optional spectral features 
+                euc_features: Optional Euclidean features
+                hyp_features: Optional hyperbolic features 
+                sph_features: Optional spherical features
+                
+            Returns:
+                Predicted numerical value
+            """
+           
+            # Find positions of " num" token (token_id = 1629)
+            num_positions = (input_ids == self.num_token_id).nonzero()
+            
+            if len(num_positions) == 0:
+                raise ValueError("No ' num' token found in input_ids")
+            
+            # Get hidden states for tokens before " num"
+            # num_positions[0] gives batch index, num_positions[1] gives position
+            batch_idx = num_positions[0,0]
+            pos_idx = num_positions[0,1] - 1  # Get previous token
+            
+            # Get hidden states for the relevant token
+            try:
+                token_hidden = hidden_states[batch_idx, pos_idx]
+            except Exception as e:
+                print("Hidden States Shape:{} batch_idx:{} pos_idx:{}".format(hidden_states.shape, batch_idx, pos_idx))
+                print(e)
+            
+            # Combine with multimodal features if provided
+            combined_features = token_hidden
+            
+            model_dtype = combined_features.dtype
+
+            if euc_features is not None:
+                euc_features = euc_features.to(torch.float32)
+                euc_features = F.normalize(euc_features, p=2, dim=-1)
+                
+                # 投影和归一化（在float32下）
+                with torch.amp.autocast("cuda", enabled=False):
+                    euc_embeds = self.struc_projector.to(torch.float32)(euc_features)
+                    euc_embeds = self.struc_norm.to(torch.float32)(euc_embeds)
+                    euc_embeds = euc_embeds * self.struc_scale.to(torch.float32)
+                
+                # 转回模型dtype并替换嵌入
+                euc_embeds = euc_embeds.to(model_dtype)
+                combined_features = combined_features + euc_embeds.squeeze()
+                
+            if hyp_features is not None:
+                hyp_features = hyp_features.to(torch.float32)
+                hyp_features = F.normalize(hyp_features, p=2, dim=-1)
+                
+                # 投影和归一化（在float32下）
+                with torch.amp.autocast("cuda", enabled=False):
+                    hyp_embeds = self.struc_projector.to(torch.float32)(hyp_features)
+                    hyp_embeds = self.struc_norm.to(torch.float32)(hyp_embeds)
+                    hyp_embeds = hyp_embeds * self.struc_scale.to(torch.float32)
+                
+                # 转回模型dtype并替换嵌入
+                hyp_embeds = hyp_embeds.to(model_dtype)
+                combined_features = combined_features + hyp_embeds.squeeze()
+                
+            if spec_features is not None:
+                spec_features = spec_features.to(torch.float32)
+                spec_features = F.normalize(spec_features, p=2, dim=-1)
+                
+                # 投影和归一化（在float32下）
+                with torch.amp.autocast("cuda", enabled=False):
+                    spec_embeds = self.spec_projector.to(torch.float32)(spec_features)
+                    spec_embeds = self.spec_norm.to(torch.float32)(spec_embeds)
+                    spec_embeds = spec_embeds * self.spec_scale.to(torch.float32)
+                
+                # 转回模型dtype并替换嵌入
+                spec_embeds = spec_embeds.to(model_dtype)
+                combined_features = combined_features + spec_embeds.squeeze()
+                
+            if sph_features is not None:
+                sph_features = sph_features.to(torch.float32)
+                sph_features = F.normalize(sph_features, p=2, dim=-1)
+                
+                # 投影和归一化（在float32下）
+                with torch.amp.autocast("cuda", enabled=False):
+                    sph_embeds = self.struc_projector.to(torch.float32)(sph_features)
+                    sph_embeds = self.struc_norm.to(torch.float32)(sph_embeds)
+                    sph_embeds = sph_embeds * self.struc_scale.to(torch.float32)
+                
+                # 转回模型dtype并替换嵌入
+                sph_embeds = sph_embeds.to(model_dtype)
+                combined_features = combined_features + sph_embeds.squeeze()
+            
+            # Use num_head to get prediction
+            # Convert to float32 for better precision
+            with torch.amp.autocast("cuda", enabled=False):
+                combined_features = combined_features.to(torch.float32)
+                prediction = self.num_head(combined_features)
+            
+            return prediction.squeeze()
 
 if __name__ == "__main__":
     checkpoint = "/mnt/data/CVPR2025/task1_data/Qwen2-VL-2B-Instruct"

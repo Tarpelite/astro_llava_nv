@@ -10,6 +10,7 @@ from transformers import AutoProcessor
 import numpy as np
 from qwen_vl_utils import process_vision_info
 from collections import defaultdict
+import h5py
 
 class Qwen2VLBaseDataset(Dataset):
     """Base dataset class with common functionality"""
@@ -149,7 +150,7 @@ class Qwen2VLBaseDataset(Dataset):
             if feat_value is not None:
                 inputs[feat_name] = torch.tensor(feat_value)
                 
-        return inputs
+        return inputs, text
 
 class Qwen2VLTrainingDataset(Qwen2VLBaseDataset):
     def __init__(
@@ -168,9 +169,15 @@ class Qwen2VLTrainingDataset(Qwen2VLBaseDataset):
         self.num_questions = num_questions
         self.max_samples = max_samples
         
-        # Load datasets
+        # 区分两种数据格式的读取
+        # 回归数据使用 astropy Table
         self.regression_data = Table.read(hdf5_paths["regression"]) if "regression" in hdf5_paths else None
-        self.classification_data = Table.read(hdf5_paths["classification"]) if "classification" in hdf5_paths else None
+        # 分类数据使用 h5py
+        self.classification_data = h5py.File(hdf5_paths["classification"], 'r') if "classification" in hdf5_paths else None
+        
+        # 获取数据集长度
+        self.regression_len = len(self.regression_data) if self.regression_data is not None else 0
+        self.classification_len = len(self.classification_data['iauname']) if self.classification_data is not None else 0
         
         # Combine all available tasks
         self.task_types = []
@@ -180,19 +187,14 @@ class Qwen2VLTrainingDataset(Qwen2VLBaseDataset):
             self.task_types.extend(self.classification_tasks)
 
     def __len__(self) -> int:
-        total_length = 0
-        if self.regression_data is not None:
-            total_length += len(self.regression_data)
-        if self.classification_data is not None:
-            total_length += len(self.classification_data)
+        total_length = self.regression_len + self.classification_len
         if self.max_samples is not None:
             return min(self.max_samples, total_length)
         return total_length
 
     def __getitem__(self, idx: int) -> Dict:
-        regression_len = len(self.regression_data) if self.regression_data is not None else 0
-        
-        if idx < regression_len:
+        if idx < self.regression_len:
+            # 使用原来的回归数据获取方式
             row = self.regression_data[idx]
             target_id = str(row['TARGETID'])
             image = self._load_regression_image(self.image_dir, target_id)
@@ -203,118 +205,308 @@ class Qwen2VLTrainingDataset(Qwen2VLBaseDataset):
                 'spec_features': row["spectrum_feature"] if "spectrum_feature" in row.colnames else None
             }
             available_tasks = [t for t in self.task_types if t in self.regression_tasks]
+            task = random.choice(available_tasks)
+            messages, answer = self._construct_messages_regression(image, task, row)
+            task_type_id = 0 # 回归任务
         else:
-            row = self.classification_data[idx - regression_len]
-            target_id = str(row['iauname'])
-            image = self._load_classification_image(row['image'])
+            # 使用新的分类数据获取方式
+            idx = idx - self.regression_len
+            # 从h5py文件中读取数据
+            target_id = str(self.classification_data['iauname'][idx].decode('utf-8'))
+            image_data = self.classification_data['image'][idx]
+            image = self._load_classification_image(image_data)
+            task_type = str(self.classification_data['task_type'][idx].decode('utf-8'))
+            class_label = int(self.classification_data['class'][idx])
+            
             features = {
-                'euc_features': row["eucembeddings"],
-                'hyp_features': row["hypembeddings"],
-                'sph_features': row["sphembeddings"],
+                'euc_features': self.classification_data["eucembeddings"][idx],
+                'hyp_features': self.classification_data["hypembeddings"][idx],
+                'sph_features': self.classification_data["sphembeddings"][idx],
                 'spec_features': None
             }
-            available_tasks = [t for t in self.task_types if t in self.classification_tasks]
-        
-        selected_tasks = random.sample(available_tasks, min(self.num_questions, len(available_tasks)))
-        
-        all_messages = []
-        answers = []
-        text_sequences = []
-        
-        for task in selected_tasks:
-            messages, answer = self._construct_messages(image, task, row, is_train=True)
-            if messages is not None:
-                all_messages.append(messages)
-                answers.append(answer)
-                text_sequences.append(messages[0]["content"][1]["text"])
-        
-        processed_samples = []
-        for messages in all_messages:
-            inputs = self.process_inputs(messages, features, is_train=True)
-            processed_samples.append(inputs)
+            
+            task_type = f"task3_{task_type}"
+            messages = self._construct_messages_classification(image, task_type, task_type, class_label)
+            answer = None
+            task_type_id = 1 # 分类任务
+
+        # Process inputs
+        inputs, text = self.process_inputs(messages, features, is_train=True)
+        inputs["task_type_id"] = torch.tensor(task_type_id)
             
         return {
             'target_id': target_id,
-            'processed_inputs': processed_samples,
-            'text_sequences': text_sequences,
-            'answers': answers,
+            'processed_inputs': [inputs],
+            'text_sequences': [text],
+            'answers': [answer],
+            "task_type_id":[task_type_id],
             'raw_image': image
         }
 
+    def _construct_messages_regression(self, image, task, row):
+        template = self.templates[task]
+        answer_key = self.answer_mapping[task]
+        answer = self._get_value(row, answer_key)
+        
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": template}
+                ]
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": " num"}]
+            }
+        ]
+        return messages, answer
+
+    def _construct_messages_classification(self, image, task_type, task_key, class_label):
+        template = self.templates[task_type.replace("-", "_")]
+        answer_text = chr(97 + class_label)  # Convert 0->a, 1->b, etc.
+        
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": template}
+                ]
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": answer_text}]
+            }
+        ]
+        return messages
+
+    def __del__(self):
+        # 只需要关闭h5py文件
+        if hasattr(self, 'classification_data') and self.classification_data is not None:
+            self.classification_data.close()
+
+
+
+
+
+
 class Qwen2VLEvaluationDataset(Qwen2VLBaseDataset):
+   def __init__(
+       self,
+       hdf5_paths: Dict[str, str],
+       image_dir: str,
+       template_path: str,
+       processor,
+       max_length: int = 512,
+       max_regression_samples: Optional[int] = None
+   ):
+       super().__init__(template_path, processor, max_length)
+       
+       self.image_dir = image_dir
+       self.max_regression_samples = max_regression_samples
+       
+       # 区分两种数据格式的读取
+       # 回归数据使用 astropy Table
+       self.regression_data = Table.read(hdf5_paths["regression"]) if "regression" in hdf5_paths else None
+       # 分类数据使用 h5py
+       self.classification_data = h5py.File(hdf5_paths["classification"], 'r') if "classification" in hdf5_paths else None
+       
+       # Prepare evaluation samples
+       self._prepare_evaluation_samples()
+
+   def _prepare_evaluation_samples(self):
+       self.eval_samples = []
+       
+       # Process regression samples with limit
+       if self.regression_data is not None:
+           regression_indices = list(range(len(self.regression_data)))
+           if self.max_regression_samples:
+               regression_indices = regression_indices[:self.max_regression_samples]
+           
+           for idx in regression_indices:
+               for task in self.regression_tasks:
+                   self.eval_samples.append(('regression', idx, task))
+       
+       # 处理分类样本 - 现在每个样本都是一个任务
+       if self.classification_data is not None:
+           for idx in range(len(self.classification_data['iauname'])):
+               task_type = str(self.classification_data['task_type'][idx].decode('utf-8'))
+               task = f"task3_{task_type}"
+               self.eval_samples.append(('classification', idx, task))
+
+   def __len__(self) -> int:
+       return len(self.eval_samples)
+
+   def __getitem__(self, idx: int) -> Dict:
+       data_type, data_idx, task = self.eval_samples[idx]
+       
+       if data_type == 'regression':
+           # 使用原来的回归数据获取方式
+           row = self.regression_data[data_idx]
+           target_id = str(row['TARGETID'])
+           image = self._load_regression_image(self.image_dir, target_id)
+           features = {
+               'euc_features': row["eucembeddings"],
+               'hyp_features': row["hypembeddings"],
+               'sph_features': row["sphembeddings"],
+               'spec_features': row["spectrum_feature"] if "spectrum_feature" in row.colnames else None
+           }
+           messages, answer = self._construct_messages_regression(image, task, row)
+           task_type_id = 0
+           
+       else:  # classification
+           # 从h5py文件中读取分类数据
+           target_id = str(self.classification_data['iauname'][data_idx].decode('utf-8'))
+           image_data = self.classification_data['image'][data_idx]
+           image = self._load_classification_image(image_data)
+           class_label = int(self.classification_data['class'][data_idx])
+           
+           features = {
+               'euc_features': self.classification_data["eucembeddings"][data_idx],
+               'hyp_features': self.classification_data["hypembeddings"][data_idx],
+               'sph_features': self.classification_data["sphembeddings"][data_idx],
+               'spec_features': None
+           }
+           
+           messages = self._construct_messages_classification(image, task, task, class_label)
+           answer = class_label
+           task_type_id = 1
+       
+       inputs, text = self.process_inputs(messages, features, is_train=False)
+       inputs["task_type_id"] = torch.tensor(task_type_id)
+
+       return {
+           'target_id': target_id,
+           'processed_inputs': [inputs],
+           'text_sequences': [text],
+           'answers': [answer],
+           'raw_image': image,
+           'task_type': task
+       }
+
+   def _construct_messages_regression(self, image, task, row):
+       template = self.templates[task]
+       answer_key = self.answer_mapping[task]
+       answer = self._get_value(row, answer_key)
+       
+       messages = [
+           {
+               "role": "user",
+               "content": [
+                   {"type": "image", "image": image},
+                   {"type": "text", "text": template}
+               ]
+           }
+       ]
+       return messages, answer
+
+   def _construct_messages_classification(self, image, task_type, task_key, class_label):
+       template = self.templates[task_type.replace("-", "_")]
+       messages = [
+           {
+               "role": "user",
+               "content": [
+                   {"type": "image", "image": image},
+                   {"type": "text", "text": template}
+               ]
+           }
+       ]
+       return messages
+
+   def __del__(self):
+       # 只需要关闭h5py文件
+       if hasattr(self, 'classification_data') and self.classification_data is not None:
+           self.classification_data.close()
+
+class Qwen2VLRegressionEvaluationDataset(Qwen2VLBaseDataset):
     def __init__(
         self,
-        hdf5_paths: Dict[str, str],
+        eval_dir: str,
         image_dir: str,
         template_path: str,
         processor,
         max_length: int = 512,
-        max_regression_samples: Optional[int] = None
+        max_samples_per_task: Optional[int] = None,
+        selected_tasks: Optional[List[str]] = None
     ):
         super().__init__(template_path, processor, max_length)
         
         self.image_dir = image_dir
-        self.max_regression_samples = max_regression_samples
+        self.max_samples_per_task = max_samples_per_task
+        self.selected_tasks = selected_tasks
         
-        # Load datasets
-        self.regression_data = Table.read(hdf5_paths["regression"]) if "regression" in hdf5_paths else None
-        self.classification_data = Table.read(hdf5_paths["classification"]) if "classification" in hdf5_paths else None
+        # 加载每个任务的数据
+        self.task_data = {}
+        tasks_to_load = self.selected_tasks if self.selected_tasks is not None else self.regression_tasks
         
-        # Prepare evaluation samples
+        for task in tasks_to_load:
+            task_file = os.path.join(eval_dir, f"eval_{task}.hdf5")
+            if os.path.exists(task_file):
+                print(f"Loading data for task {task} from {task_file}")
+                self.task_data[task] = Table.read(task_file)
+                print(f"Loaded {len(self.task_data[task])} samples for {task}")
+            else:
+                print(f"Warning: No data file found for task {task} at {task_file}")
+        
+        # 准备评估样本
         self._prepare_evaluation_samples()
 
     def _prepare_evaluation_samples(self):
         self.eval_samples = []
         
-        # Process regression samples with limit
-        if self.regression_data is not None:
-            regression_indices = list(range(len(self.regression_data)))
-            if self.max_regression_samples:
-                regression_indices = regression_indices[:self.max_regression_samples]
+        # 为每个已加载的任务准备样本
+        for task, data in self.task_data.items():
+            indices = list(range(len(data)))
+            if self.max_samples_per_task:
+                random.shuffle(indices)
+                indices = indices[:self.max_samples_per_task]
             
-            for idx in regression_indices:
-                for task in self.regression_tasks:
-                    self.eval_samples.append(('regression', idx, task))
-        
-        # Process all valid classification samples for each task
-        if self.classification_data is not None:
-            for idx in range(len(self.classification_data)):
-                row = self.classification_data[idx]
-                for task in self.classification_tasks:
-                    task_key = task.replace('task3_', '').replace("_", "-")
-                    if row[task_key] != -1:  # Only include valid classifications
-                        self.eval_samples.append(('classification', idx, task))
+            for idx in indices:
+                self.eval_samples.append((task, idx))
 
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self.eval_samples)
 
     def __getitem__(self, idx: int) -> Dict:
-        data_type, data_idx, task = self.eval_samples[idx]
+        task, data_idx = self.eval_samples[idx]
         
-        if data_type == 'regression':
-            row = self.regression_data[data_idx]
-            target_id = str(row['TARGETID'])
-            image = self._load_regression_image(self.image_dir, target_id)
-            features = {
-                'euc_features': row["eucembeddings"],
-                'hyp_features': row["hypembeddings"],
-                'sph_features': row["sphembeddings"],
-                'spec_features': row["spectrum_feature"] if "spectrum_feature" in row.colnames else None
+        # 从对应任务的数据中获取样本
+        row = self.task_data[task][data_idx]
+        target_id = str(row['TARGETID'])
+        
+        # 读取图像
+        image = self._load_regression_image(self.image_dir, target_id)
+        
+        # 获取目标值
+        answer_key = self.answer_mapping[task]
+        answer = self._get_value(row, answer_key)
+        
+        # 准备特征
+        features = {
+            'euc_features': row["eucembeddings"],
+            'hyp_features': row["hypembeddings"],
+            'sph_features': row["sphembeddings"],
+            'spec_features': row["spectrum_feature"] if "spectrum_feature" in row.colnames else None
+        }
+        
+        # 构建消息
+        template = self.templates[task]
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": template}
+                ]
             }
-        else:  # classification
-            row = self.classification_data[data_idx]
-            target_id = str(row['iauname'])
-            image = self._load_classification_image(row['image'])
-            features = {
-                'euc_features': row["eucembeddings"],
-                'hyp_features': row["hypembeddings"],
-                'sph_features': row["sphembeddings"],
-                'spec_features': None
-            }
+        ]
         
-        messages, answer = self._construct_messages(image, task, row, is_train=False)
-        inputs = self.process_inputs(messages, features, is_train=False)
-        
+        # 处理输入
+        inputs, text = self.process_inputs(messages, features, is_train=False)
+        inputs["task_type_id"] = torch.tensor(0)  # 回归任务
+
         return {
             'target_id': target_id,
             'processed_inputs': [inputs],
@@ -324,7 +516,112 @@ class Qwen2VLEvaluationDataset(Qwen2VLBaseDataset):
             'task_type': task
         }
 
-# 继续完成collate_fn
+class Qwen2VLClassificationEvaluationDataset(Qwen2VLBaseDataset):
+    def __init__(
+        self,
+        eval_dir: str,
+        image_dir: str,
+        template_path: str,
+        processor,
+        max_length: int = 512,
+        max_samples_per_task: Optional[int] = None,
+        selected_tasks: Optional[List[str]] = None
+    ):
+        super().__init__(template_path, processor, max_length)
+        
+        self.image_dir = image_dir
+        self.max_samples_per_task = max_samples_per_task
+        self.selected_tasks = selected_tasks
+        
+        # 加载每个任务的数据
+        self.task_data = {}
+        tasks_to_load = self.selected_tasks if self.selected_tasks is not None else [
+            task.replace('task3_', '') for task in self.classification_tasks
+        ]
+        
+        for task in tasks_to_load:
+            task_file = os.path.join(eval_dir, f"eval_task3_{task}.hdf5")
+            if os.path.exists(task_file):
+                print(f"Loading data for task {task} from {task_file}")
+                self.task_data[task] = Table.read(task_file)
+                print(f"Loaded {len(self.task_data[task])} samples for {task}")
+            else:
+                print(f"Warning: No data file found for task {task} at {task_file}")
+        
+        # 准备评估样本
+        self._prepare_evaluation_samples()
+
+    def _prepare_evaluation_samples(self):
+        self.eval_samples = []
+        
+        # 为每个已加载的任务准备样本
+        for task, data in self.task_data.items():
+            # 过滤掉无效标签的样本
+            # print(data.keys())
+            # task="class"
+            valid_indices = [i for i in range(len(data)) if data["class"][i] != -1]
+            
+            if self.max_samples_per_task and len(valid_indices) > self.max_samples_per_task:
+                random.shuffle(valid_indices)
+                valid_indices = valid_indices[:self.max_samples_per_task]
+            
+            for idx in valid_indices:
+                self.eval_samples.append((f"task3_{task}", idx))
+
+    def __getitem__(self, idx: int) -> Dict:
+        task, data_idx = self.eval_samples[idx]
+        task_name = task.replace('task3_', '')
+        
+        # 获取数据
+        # print("task:{}".format(task))
+        # print("task_name:{}".format(task_name))
+        row = self.task_data[task_name][data_idx]
+        target_id = str(row['iauname'])
+        
+        # 读取图像数据
+        image = Image.fromarray(row['image'].transpose(1, 2, 0).astype(np.uint8))
+        
+        # 获取标签
+        class_label = int(row["class"])
+        
+        # 准备特征
+        features = {
+            'euc_features': row["eucembeddings"],
+            'hyp_features': row["hypembeddings"],
+            'sph_features': row["sphembeddings"],
+            'spec_features': None
+        }
+        
+        # 构建消息
+        template = self.templates[task.replace("-", "_")]
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": template}
+                ]
+            }
+        ]
+        
+        # 处理输入
+        inputs, text = self.process_inputs(messages, features, is_train=False)
+        inputs["task_type_id"] = torch.tensor(1)  # 分类任务
+
+        return {
+            'target_id': target_id,
+            'processed_inputs': [inputs],
+            'text_sequences': [text],
+            'answers': [class_label],
+            'raw_image': image,
+            'task_type': task
+        }
+
+    def __len__(self) -> int:
+        return len(self.eval_samples)
+
+
+
 def collate_fn(batch: List[Dict]) -> Dict:
     target_ids = [item['target_id'] for item in batch]
     all_text_sequences = [item['text_sequences'] for item in batch]
@@ -342,6 +639,7 @@ def collate_fn(batch: List[Dict]) -> Dict:
         'attention_mask': torch.stack([inputs['attention_mask'] for inputs in all_processed_inputs]),
         'pixel_values': torch.stack([inputs['pixel_values'] for inputs in all_processed_inputs]),
         'image_grid_thw': torch.stack([inputs['image_grid_thw'] for inputs in all_processed_inputs]),
+        "task_type_id": torch.stack([inputs["task_type_id"] for inputs in all_processed_inputs])
     }
     
     # Add optional features if they exist
@@ -464,7 +762,7 @@ def test_datasets():
         template_path=template_path,
         processor=processor,
         max_length=512,
-        max_regression_samples=50  # 限制回归任务的样本数
+        max_regression_samples=10  # 限制回归任务的样本数
     )
     
     print(f"Evaluation dataset length: {len(eval_dataset)}")
