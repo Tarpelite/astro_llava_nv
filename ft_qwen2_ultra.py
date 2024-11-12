@@ -268,12 +268,32 @@ def evaluate_classification(model, eval_dataloader, args, global_step):
         return ""
     
     def extract_class_label(answer: str) -> int:
-        """从回答中提取分类标签"""
+        """从回答中提取分类标签
+        
+        支持的模式包括:
+        - 完整括号: (a), (b), (c)
+        - 左括号: (a, (b, (c
+        - 混合模式: (a), (b, (c)
+        
+        Args:
+            answer: str, 包含答案的字符串
+        
+        Returns:
+            int: 提取的类别标签(0-25对应a-z), 提取失败返回-1
+        """
         if not answer:  # 如果答案为空
             return -1
-            
-        # 在回答中寻找(a), (b), (c)等模式
-        matches = re.search(r'\(([a-z])\)', answer.lower())
+                
+        # 匹配以下模式:
+        # 1. (a) - 完整括号
+        # 2. (a  - 只有左括号
+        # 标准化为小写并移除空白字符
+        answer = answer.lower().strip()
+        
+        # 查找所有可能的模式
+        # (?:\)|\b) 表示匹配右括号或者词边界
+        matches = re.search(r'\(([a-z])(?:\)|\b)', answer)
+        
         if matches:
             return ord(matches.group(1)) - ord('a')
         return -1
