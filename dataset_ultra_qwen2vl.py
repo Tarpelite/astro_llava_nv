@@ -239,7 +239,7 @@ class Qwen2VLTrainingDataset(Qwen2VLBaseDataset):
             'processed_inputs': [inputs],
             'text_sequences': [text],
             'answers': [answer],
-            "task_type_id":[task_type_id],
+            "task_type":[task_type_id],
             'raw_image': image
         }
 
@@ -277,7 +277,7 @@ class Qwen2VLTrainingDataset(Qwen2VLBaseDataset):
             },
             {
                 "role": "assistant",
-                "content": [{"type": "text", "text": answer_text}]
+                "content": [{"type": "text", "text": "({})".format(answer_text)}]
             }
         ]
         return messages
@@ -679,6 +679,7 @@ def collate_fn(batch: List[Dict]) -> Dict:
     batch_inputs["labels"] = labels
     batch_inputs["answers"] = all_answers
     
+
     output = {
         'target_ids': target_ids,
         'text_sequences': all_text_sequences,

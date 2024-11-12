@@ -342,6 +342,7 @@ class AstroQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
             model_dtype = inputs_embeds.dtype  # 获取模型当前使用的dtype
             # Process spectral features
 
+          
             spec_embeds = None
             if spec_features is not None:
                 # 转换到float32进行处理
@@ -448,7 +449,6 @@ class AstroQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
         loss = None
 
         if labels is not None:
-            
             # Language modeling loss
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()

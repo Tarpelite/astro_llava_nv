@@ -17,6 +17,13 @@ from sklearn.metrics import r2_score, accuracy_score, f1_score
 import re
 import math
 from tqdm import tqdm
+from peft import (
+    LoraConfig,
+    get_peft_model,
+    prepare_model_for_kbit_training,
+    TaskType,
+)
+
 
 from models_astro_ultra_qwen2 import AstroQwen2VLForConditionalGeneration
 from dataset_ultra_qwen2vl import Qwen2VLTrainingDataset, Qwen2VLEvaluationDataset, collate_fn, Qwen2VLClassificationEvaluationDataset, Qwen2VLRegressionEvaluationDataset
@@ -90,6 +97,8 @@ def parse_args():
 
 def prepare_model_for_training(model):
     """冻结基础模型参数,只训练新增参数"""
+
+    
     # 首先冻结所有参数
     for param in model.parameters():
         param.requires_grad = False
@@ -157,7 +166,7 @@ def evaluate_regression(model, eval_dataloader, processor, args, global_step):
     for batch in eval_dataloader:
         with torch.no_grad():
             batch_tasks = batch['task_types']
-            # print(batch["text_sequences"][0][0])
+            print(batch["text_sequences"][0][0])
             
             # 一次只生成一个token
             for i in range(5):  # 最多生成5个token
@@ -463,8 +472,8 @@ def train():
         for step, batch in enumerate(tqdm(train_dataloader)):
             with accelerator.accumulate(model):
                 # import pudb;pu.db;
-                # if batch["task_types"][0][0] == 1:
-                #     print(batch["text_sequences"][0][0])
+                if batch["task_types"][0][0] == 1:
+                    print(batch["text_sequences"][0][0])
                 outputs = model(**batch["processed_inputs"], return_dict=True)
                 loss = outputs.loss
                 # print(loss)
